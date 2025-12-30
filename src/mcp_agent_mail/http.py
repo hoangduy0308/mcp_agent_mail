@@ -1090,6 +1090,37 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:  # type: ignore[
     # Expose composed lifespan via router
     fastapi_app.router.lifespan_context = lifespan_context
 
+    # ----- SSE Transport for legacy clients (Kilo Code, etc.) -----
+    try:
+        from mcp.server.sse import SseServerTransport
+        from starlette.requests import Request as StarletteRequest
+        from starlette.responses import Response as StarletteResponse
+        from starlette.routing import Route
+
+        sse_transport = SseServerTransport("/messages/")
+
+        async def handle_sse(request: StarletteRequest) -> StarletteResponse:
+            async with sse_transport.connect_sse(
+                request.scope, request.receive, request._send
+            ) as (read_stream, write_stream):
+                await server._mcp_server.run(
+                    read_stream,
+                    write_stream,
+                    server._mcp_server.create_initialization_options(),
+                )
+            # Return empty response to avoid NoneType error (per MCP SSE docs)
+            return StarletteResponse()
+
+        sse_route = Route("/sse", endpoint=handle_sse)
+        messages_mount = Mount("/messages/", app=sse_transport.handle_post_message)
+        fastapi_app.router.routes.insert(0, sse_route)
+        fastapi_app.router.routes.insert(1, messages_mount)
+        print("[DEBUG] SSE transport mounted at /sse and /messages/")
+    except ImportError as e:
+        print(f"[DEBUG] SSE transport not available: {e}")
+    except Exception as e:
+        print(f"[DEBUG] Failed to setup SSE transport: {e}")
+
     # ----- Simple SSR Mail UI -----
     def _register_mail_ui() -> None:
         import bleach  # type: ignore

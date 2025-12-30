@@ -3570,7 +3570,10 @@ def build_mcp_server() -> FastMCP:
         }}}
         ```
         """
+        import logging as _log
+        _log.warning(">>> send_message ENTER project_key=%s sender=%s", project_key, sender_name)
         project = await _get_project_by_identifier(project_key)
+        _log.warning(">>> send_message GOT PROJECT id=%s", project.id)
 
         # Normalize 'to' parameter - accept single string and convert to list
         if isinstance(to, str):
@@ -3679,7 +3682,9 @@ def build_mcp_server() -> FastMCP:
                 c.print(Panel(body, title=title, border_style="green"))
             except Exception:
                 pass
+        _log.warning(">>> send_message BEFORE _get_agent")
         sender = await _get_agent(project, sender_name)
+        _log.warning(">>> send_message GOT SENDER id=%s", sender.id)
         # Enforce contact policies (per-recipient) with auto-allow heuristics
         settings_local = get_settings()
         # Allow ack-required messages to bypass contact enforcement entirely
@@ -3931,6 +3936,7 @@ def build_mcp_server() -> FastMCP:
                         data=err_data,
                     )
         # Split recipients into local vs external (approved links)
+        _log.warning(">>> send_message BEFORE recipient routing")
         local_to: list[str] = []
         local_cc: list[str] = []
         local_bcc: list[str] = []

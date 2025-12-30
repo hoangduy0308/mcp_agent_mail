@@ -11,6 +11,7 @@ from typing import Any, TypeVar
 
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 from sqlmodel import SQLModel
 
 from .config import DatabaseSettings, Settings, get_settings
@@ -133,17 +134,28 @@ def _build_engine(settings: DatabaseSettings) -> AsyncEngine:
             "check_same_thread": False,  # Required for async SQLite
         }
 
-    engine = create_async_engine(
-        settings.url,
-        echo=settings.echo,
-        future=True,
-        pool_pre_ping=True,
-        pool_size=25,  # Increased for high-concurrency workloads
-        max_overflow=25,  # Allow up to 50 total connections under load
-        pool_timeout=30,  # Fail fast with clear error instead of hanging indefinitely
-        pool_recycle=3600,  # Recycle connections after 1 hour to prevent stale handles
-        connect_args=connect_args,
-    )
+    # For SQLite: Use NullPool to avoid connection pool contention
+    # SQLite handles concurrent access poorly with multiple pooled connections
+    if is_sqlite:
+        engine = create_async_engine(
+            settings.url,
+            echo=settings.echo,
+            future=True,
+            poolclass=NullPool,  # No pooling for SQLite - each request gets fresh connection
+            connect_args=connect_args,
+        )
+    else:
+        engine = create_async_engine(
+            settings.url,
+            echo=settings.echo,
+            future=True,
+            pool_pre_ping=True,
+            pool_size=25,
+            max_overflow=25,
+            pool_timeout=30,
+            pool_recycle=3600,
+            connect_args=connect_args,
+        )
 
     # For SQLite: Set up event listener to configure each connection with WAL mode
     if is_sqlite:

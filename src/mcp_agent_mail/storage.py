@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import ctypes
 import hashlib
 import json
-import os
+import logging
 import re
 import sys
 import time
@@ -15,16 +16,224 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterable, Sequence, TypeVar
+from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Sequence, TypeVar
 
-from filelock import SoftFileLock, Timeout
 from git import Actor, Repo
 from git.objects.tree import Tree
 from PIL import Image
 
 from .config import Settings
 
+if TYPE_CHECKING:
+    pass
+
+
+# Windows Named Mutex constants
+WAIT_OBJECT_0 = 0x00000000
+WAIT_ABANDONED = 0x00000080
+WAIT_TIMEOUT = 0x00000102
+WAIT_FAILED = 0xFFFFFFFF
+INFINITE = 0xFFFFFFFF
+
+
+class CrossProcessLock:
+    """Cross-process lock using Windows Named Mutex or Unix file locks.
+
+    On Windows: Uses Named Mutex which auto-releases when process dies/crashes.
+    On Unix: Falls back to fcntl file locking (advisory locks).
+
+    This solves the Windows SoftFileLock problem where file handles remain
+    locked even after process death, causing WinError 32.
+    """
+
+    def __init__(self, name: str, timeout_seconds: float = 60.0) -> None:
+        self._name = name
+        self._timeout = timeout_seconds
+        self._handle: int | None = None
+        self._held = False
+        self._abandoned = False
+        self._is_windows = sys.platform == "win32"
+        self._lock_file: Any = None
+        self._lock_fd: int | None = None
+
+    @staticmethod
+    def name_from_path(path: str | Path) -> str:
+        """Create a valid mutex name from a file path.
+
+        Mutex names on Windows:
+        - Can contain any character except backslash
+        - Max 260 chars
+        - Use Local\\ prefix for session-local (default)
+        """
+        path_str = str(Path(path).resolve())
+        path_hash = hashlib.sha256(path_str.encode()).hexdigest()[:32]
+        return f"Local\\mcp_agent_mail_{path_hash}"
+
+    def acquire(self, timeout_ms: int | None = None) -> bool:
+        """Acquire the lock. Returns True if acquired, False on timeout.
+
+        Raises RuntimeError on failure.
+        Sets self._abandoned = True if the lock was abandoned by a dead process.
+        """
+        if timeout_ms is None:
+            timeout_ms = int(self._timeout * 1000)
+
+        if self._is_windows:
+            return self._acquire_windows(timeout_ms)
+        else:
+            return self._acquire_unix(timeout_ms)
+
+    def _acquire_windows(self, timeout_ms: int) -> bool:
+        """Acquire using Windows Named Mutex."""
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+
+        self._handle = kernel32.CreateMutexW(
+            None,  # default security
+            False,  # not initially owned
+            self._name  # mutex name
+        )
+
+        if not self._handle:
+            error = ctypes.get_last_error()
+            raise RuntimeError(f"Failed to create mutex '{self._name}': error {error}")
+
+        result = kernel32.WaitForSingleObject(self._handle, timeout_ms)
+
+        if result == WAIT_OBJECT_0:
+            self._held = True
+            self._abandoned = False
+            return True
+        elif result == WAIT_ABANDONED:
+            self._held = True
+            self._abandoned = True
+            logging.warning(
+                f"Mutex '{self._name}' was abandoned by a dead process. "
+                "Previous holder may have crashed mid-operation."
+            )
+            return True
+        elif result == WAIT_TIMEOUT:
+            kernel32.CloseHandle(self._handle)
+            self._handle = None
+            return False
+        else:
+            error = ctypes.get_last_error()
+            kernel32.CloseHandle(self._handle)
+            self._handle = None
+            raise RuntimeError(f"WaitForSingleObject failed: error {error}")
+
+    def _acquire_unix(self, timeout_ms: int) -> bool:
+        """Acquire using Unix fcntl file locking."""
+        import errno
+        import fcntl
+
+        lock_path = Path(f"/tmp/{self._name.replace('/', '_').replace('\\', '_')}.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self._lock_file = lock_path.open("w")
+        self._lock_fd = self._lock_file.fileno()
+
+        start = time.monotonic()
+        timeout_sec = timeout_ms / 1000.0
+
+        while True:
+            try:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]
+                self._held = True
+                self._abandoned = False
+                return True
+            except OSError as e:
+                if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                    raise
+                if time.monotonic() - start >= timeout_sec:
+                    self._lock_file.close()
+                    self._lock_file = None
+                    self._lock_fd = None
+                    return False
+                time.sleep(0.01)
+
+    def release(self) -> None:
+        """Release the lock."""
+        if not self._held:
+            return
+
+        if self._is_windows:
+            self._release_windows()
+        else:
+            self._release_unix()
+
+        self._held = False
+
+    def _release_windows(self) -> None:
+        """Release Windows mutex."""
+        if self._handle:
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            kernel32.ReleaseMutex(self._handle)
+            kernel32.CloseHandle(self._handle)
+            self._handle = None
+
+    def _release_unix(self) -> None:
+        """Release Unix file lock."""
+        import fcntl
+
+        if self._lock_fd is not None:
+            fcntl.flock(self._lock_fd, fcntl.LOCK_UN)  # type: ignore[attr-defined]
+        if self._lock_file is not None:
+            self._lock_file.close()
+            self._lock_file = None
+            self._lock_fd = None
+
+    @property
+    def was_abandoned(self) -> bool:
+        """Returns True if the lock was acquired from an abandoned state.
+
+        This indicates the previous holder crashed and recovery may be needed.
+        """
+        return self._abandoned
+
+    def __enter__(self) -> "CrossProcessLock":
+        if not self.acquire():
+            raise TimeoutError(f"Timed out acquiring lock '{self._name}'")
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.release()
+
 _IMAGE_PATTERN = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<path>[^)]+)\)")
+
+
+def _pid_alive(pid: int) -> bool:
+    """Check if a process with the given PID is alive (cross-platform)."""
+    if pid <= 0:
+        return False
+
+    try:
+        import psutil  # type: ignore[import-not-found]
+
+        return bool(psutil.pid_exists(pid))
+    except ImportError:
+        pass
+
+    if sys.platform == "win32":
+        try:
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if handle:
+                kernel32.CloseHandle(handle)
+                return True
+            return False
+        except Exception:
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
 
 
 @dataclass(slots=True)
@@ -46,6 +255,125 @@ class ProjectArchive:
 
 _PROCESS_LOCKS: dict[tuple[int, str], asyncio.Lock] = {}
 _PROCESS_LOCK_OWNERS: dict[tuple[int, str], int] = {}
+# Track when each lock was acquired and by which task name
+_PROCESS_LOCK_INFO: dict[tuple[int, str], tuple[float, str]] = {}  # (timestamp, task_name)
+# Store references to held CrossProcessLock instances so we can force-release them
+_HELD_CROSS_PROCESS_LOCKS: dict[tuple[int, str], "CrossProcessLock"] = {}
+# Store references to the actual task objects so we can cancel them
+_LOCK_HOLDER_TASKS: dict[tuple[int, str], asyncio.Task[Any]] = {}
+
+# Maximum time a lock can be held before it's considered stuck (in seconds)
+_MAX_LOCK_HOLD_TIME: float = 120.0  # 2 minutes - most operations should complete much faster
+
+
+def force_release_stale_in_process_locks(max_age_seconds: float = _MAX_LOCK_HOLD_TIME) -> list[str]:
+    """Force-release in-process locks that have been held too long.
+
+    This is a recovery mechanism for stuck tasks that hold locks indefinitely.
+    It cancels the stuck task and releases both the CrossProcessLock and asyncio.Lock.
+
+    Returns a list of lock paths that were force-released.
+    """
+    now = time.time()
+    released: list[str] = []
+
+    for loop_key, (acquired_at, task_name) in list(_PROCESS_LOCK_INFO.items()):
+        age = now - acquired_at
+        if age < max_age_seconds:
+            continue
+
+        lock_path = loop_key[1]  # loop_key is (loop_id, lock_path_str)
+        logging.warning(
+            f"Force-releasing stale in-process lock at {lock_path} "
+            f"(held by '{task_name}' for {age:.1f}s, max={max_age_seconds}s)"
+        )
+
+        # Cancel the stuck task if we have a reference
+        stuck_task = _LOCK_HOLDER_TASKS.pop(loop_key, None)
+        if stuck_task is not None and not stuck_task.done():
+            logging.warning(f"Cancelling stuck task '{task_name}' that held lock for {age:.1f}s")
+            stuck_task.cancel(f"Lock held too long ({age:.1f}s > {max_age_seconds}s)")
+
+        # Release the CrossProcessLock (Windows mutex auto-releases on process death anyway)
+        cross_lock = _HELD_CROSS_PROCESS_LOCKS.pop(loop_key, None)
+        if cross_lock is not None:
+            try:
+                cross_lock.release()
+                logging.info(f"Force-released CrossProcessLock for {lock_path}")
+            except Exception as e:
+                logging.warning(f"Error force-releasing CrossProcessLock for {lock_path}: {e}")
+
+        # Clean up tracking dicts
+        _PROCESS_LOCK_INFO.pop(loop_key, None)
+        _PROCESS_LOCK_OWNERS.pop(loop_key, None)
+
+        # Release the asyncio.Lock if it's held
+        process_lock = _PROCESS_LOCKS.get(loop_key)
+        if process_lock is not None and process_lock.locked():
+            try:
+                process_lock.release()
+                logging.info(f"Force-released asyncio.Lock for {lock_path}")
+            except RuntimeError as e:
+                logging.warning(f"Could not release asyncio.Lock for {lock_path}: {e}")
+
+        released.append(lock_path)
+
+    return released
+
+
+async def async_force_release_stale_locks(max_age_seconds: float = _MAX_LOCK_HOLD_TIME) -> list[str]:
+    """Async version of force_release_stale_in_process_locks.
+
+    This version can properly await the cancelled task to ensure it has a chance
+    to clean up before we forcibly release its locks.
+    """
+    now = time.time()
+    released: list[str] = []
+
+    for loop_key, (acquired_at, task_name) in list(_PROCESS_LOCK_INFO.items()):
+        age = now - acquired_at
+        if age < max_age_seconds:
+            continue
+
+        lock_path = loop_key[1]
+        logging.warning(
+            f"Async force-releasing stale in-process lock at {lock_path} "
+            f"(held by '{task_name}' for {age:.1f}s, max={max_age_seconds}s)"
+        )
+
+        # Cancel the stuck task and wait briefly for it to process
+        stuck_task = _LOCK_HOLDER_TASKS.pop(loop_key, None)
+        if stuck_task is not None and not stuck_task.done():
+            logging.warning(f"Cancelling stuck task '{task_name}' that held lock for {age:.1f}s")
+            stuck_task.cancel(f"Lock held too long ({age:.1f}s > {max_age_seconds}s)")
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                await asyncio.wait_for(asyncio.shield(stuck_task), timeout=1.0)
+
+        # Release the CrossProcessLock
+        cross_lock = _HELD_CROSS_PROCESS_LOCKS.pop(loop_key, None)
+        if cross_lock is not None:
+            try:
+                cross_lock.release()
+                logging.info(f"Force-released CrossProcessLock for {lock_path}")
+            except Exception as e:
+                logging.warning(f"Error force-releasing CrossProcessLock for {lock_path}: {e}")
+
+        # Clean up tracking dicts
+        _PROCESS_LOCK_INFO.pop(loop_key, None)
+        _PROCESS_LOCK_OWNERS.pop(loop_key, None)
+
+        # Release the asyncio.Lock
+        process_lock = _PROCESS_LOCKS.get(loop_key)
+        if process_lock is not None and process_lock.locked():
+            try:
+                process_lock.release()
+                logging.info(f"Force-released asyncio.Lock for {lock_path}")
+            except RuntimeError as e:
+                logging.warning(f"Could not release asyncio.Lock for {lock_path}: {e}")
+
+        released.append(lock_path)
+
+    return released
 
 
 class _LRURepoCache:
@@ -401,64 +729,146 @@ async def stop_commit_queue() -> None:
 
 
 class AsyncFileLock:
-    """Async-friendly wrapper around SoftFileLock with metadata tracking."""
+    """Async-friendly cross-process lock using Windows Named Mutex.
+
+    On Windows: Uses Named Mutex which auto-releases when process dies.
+    On Unix: Falls back to fcntl advisory locks.
+
+    This replaces the previous SoftFileLock approach which had issues with
+    file handles remaining locked after process death on Windows.
+    """
 
     def __init__(
         self,
         path: Path,
         *,
         timeout_seconds: float = 60.0,
-        stale_timeout_seconds: float = 180.0,
+        stale_timeout_seconds: float = 180.0,  # kept for API compatibility, not used
     ) -> None:
         self._path = Path(path)
-        self._lock = SoftFileLock(str(self._path))
-        self._timeout = float(timeout_seconds)
-        self._stale_timeout = float(max(stale_timeout_seconds, 0.0))
-        self._pid = os.getpid()
-        self._metadata_path = self._path.parent / f"{self._path.name}.owner.json"
-        self._held = False
         self._lock_key = str(self._path.resolve())
+        self._mutex_name = CrossProcessLock.name_from_path(self._lock_key)
+        self._cross_process_lock: CrossProcessLock | None = None
+        self._timeout = float(timeout_seconds)
+        self._held = False
         self._loop_key: tuple[int, str] | None = None
         self._process_lock: asyncio.Lock | None = None
         self._process_lock_held = False
+        self._was_abandoned = False
 
     async def __aenter__(self) -> None:
         loop = asyncio.get_running_loop()
         self._loop_key = (id(loop), self._lock_key)
+
+        # FIRST: Force-release any stale in-process locks before attempting to acquire
+        released = await async_force_release_stale_locks()
+        if released:
+            logging.info(f"Pre-acquire: force-released {len(released)} stale in-process locks")
+
+        # Acquire in-process asyncio.Lock first
         process_lock = _PROCESS_LOCKS.get(self._loop_key)
         if process_lock is None:
             process_lock = asyncio.Lock()
             _PROCESS_LOCKS[self._loop_key] = process_lock
+
         current_task = asyncio.current_task()
         owner_id = _PROCESS_LOCK_OWNERS.get(self._loop_key)
         current_task_id = id(current_task) if current_task else id(self)
+
         if owner_id == current_task_id:
             raise RuntimeError(f"Re-entrant AsyncFileLock acquisition detected for {self._path}")
+
         self._process_lock = process_lock
-        await self._process_lock.acquire()
+        logging.debug(f"AsyncFileLock: waiting for process lock {self._lock_key}")
+
+        try:
+            await asyncio.wait_for(self._process_lock.acquire(), timeout=self._timeout)
+        except asyncio.TimeoutError:
+            # Try force-releasing stale locks one more time
+            released = await async_force_release_stale_locks()
+            if released and self._lock_key in released:
+                try:
+                    await asyncio.wait_for(self._process_lock.acquire(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass
+                else:
+                    logging.info(f"Acquired lock after force-release: {self._lock_key}")
+                    self._process_lock_held = True
+                    _PROCESS_LOCK_OWNERS[self._loop_key] = current_task_id
+                    current = asyncio.current_task()
+                    task_name = current.get_name() if current else "unknown"
+                    _PROCESS_LOCK_INFO[self._loop_key] = (time.time(), task_name)
+                    if current is not None:
+                        _LOCK_HOLDER_TASKS[self._loop_key] = current
+                    return await self._acquire_cross_process_lock()
+
+            lock_info = _PROCESS_LOCK_INFO.get(self._loop_key)
+            if lock_info:
+                acquired_at, task_name = lock_info
+                held_for = time.time() - acquired_at
+                raise TimeoutError(
+                    f"Timed out waiting for in-process lock {self._path} after {self._timeout:.2f}s. "
+                    f"Lock held by '{task_name}' for {held_for:.1f}s."
+                ) from None
+            else:
+                raise TimeoutError(
+                    f"Timed out waiting for in-process lock {self._path} after {self._timeout:.2f}s. "
+                    "Another task in this process may be holding the lock."
+                ) from None
+
+        logging.debug(f"AsyncFileLock: acquired process lock {self._lock_key}")
         self._process_lock_held = True
         _PROCESS_LOCK_OWNERS[self._loop_key] = current_task_id
+
+        current = asyncio.current_task()
+        task_name = current.get_name() if current else "unknown"
+        _PROCESS_LOCK_INFO[self._loop_key] = (time.time(), task_name)
+        if current is not None:
+            _LOCK_HOLDER_TASKS[self._loop_key] = current
+
+        return await self._acquire_cross_process_lock()
+
+    async def _acquire_cross_process_lock(self) -> None:
+        """Acquire the cross-process lock (Windows mutex or Unix flock)."""
         try:
-            while True:
-                try:
-                    if self._timeout <= 0:
-                        await _to_thread(self._lock.acquire)
-                    else:
-                        await _to_thread(self._lock.acquire, self._timeout)
-                    self._held = True
-                    await _to_thread(self._write_metadata)
-                    break
-                except Timeout:
-                    cleaned = await _to_thread(self._cleanup_if_stale)
-                    if cleaned:
-                        continue
-                    raise TimeoutError(
-                        f"Timed out acquiring lock {self._path} after {self._timeout:.2f}s "
-                        "and no stale owner detected."
-                    ) from None
+            self._cross_process_lock = CrossProcessLock(
+                self._mutex_name,
+                timeout_seconds=self._timeout
+            )
+
+            logging.debug(f"AsyncFileLock: acquiring cross-process lock {self._mutex_name}")
+
+            # Run blocking acquire in thread pool
+            acquired = await _to_thread(self._cross_process_lock.acquire)
+
+            if not acquired:
+                raise TimeoutError(
+                    f"Timed out acquiring cross-process lock for {self._path} "
+                    f"after {self._timeout:.2f}s"
+                )
+
+            self._held = True
+            self._was_abandoned = self._cross_process_lock.was_abandoned
+
+            if self._was_abandoned:
+                logging.warning(
+                    f"Lock for {self._path} was abandoned by a dead process. "
+                    "Previous operation may have been interrupted."
+                )
+
+            # Store reference for force-release
+            if self._loop_key is not None:
+                _HELD_CROSS_PROCESS_LOCKS[self._loop_key] = self._cross_process_lock
+
+            logging.debug(f"AsyncFileLock: acquired cross-process lock {self._mutex_name}")
+
         except Exception:
+            # Clean up on failure
             if self._loop_key is not None:
                 _PROCESS_LOCK_OWNERS.pop(self._loop_key, None)
+                _PROCESS_LOCK_INFO.pop(self._loop_key, None)
+                _HELD_CROSS_PROCESS_LOCKS.pop(self._loop_key, None)
+                _LOCK_HOLDER_TASKS.pop(self._loop_key, None)
             if self._process_lock_held and self._process_lock:
                 self._process_lock.release()
                 self._process_lock_held = False
@@ -470,147 +880,41 @@ class AsyncFileLock:
                 _PROCESS_LOCKS.pop(self._loop_key, None)
             self._process_lock = None
             raise
-        return None
 
-    def _cleanup_if_stale(self) -> bool:
-        """Remove lock and metadata when the lock is stale.
-
-        A lock is considered stale if EITHER:
-        1. The owning process no longer exists, OR
-        2. The lock age exceeds the stale timeout
-
-        This ensures locks are cleaned up promptly when either condition is met.
-        """
-        if not self._path.exists():
-            return False
-        now = time.time()
-        metadata: dict[str, Any] = {}
-        if self._metadata_path.exists():
-            try:
-                metadata = json.loads(self._metadata_path.read_text(encoding="utf-8"))
-            except Exception:
-                metadata = {}
-        pid_val = metadata.get("pid")
-        pid_int: int | None = None
-        if pid_val is not None:
-            with contextlib.suppress(Exception):
-                pid_int = int(pid_val)
-        owner_alive = self._pid_alive(pid_int) if pid_int else False
-        created_ts = metadata.get("created_ts")
-        age = None
-        if isinstance(created_ts, (int, float)):
-            age = now - float(created_ts)
-        else:
-            with contextlib.suppress(Exception):
-                age = now - self._path.stat().st_mtime
-
-        # Lock is stale if EITHER the owner is dead OR the age exceeds timeout
-        # Special case: if stale_timeout is 0, only check owner liveness (ignore age)
-        is_stale = False
-        if not owner_alive:
-            # Owner process is dead - lock is stale regardless of age
-            is_stale = True
-        elif self._stale_timeout > 0 and isinstance(age, (int, float)) and age >= self._stale_timeout:
-            # Lock is too old - stale regardless of owner status
-            # (only if stale_timeout > 0, otherwise age check is disabled)
-            is_stale = True
-
-        if not is_stale:
-            return False
-
-        # Clean up stale lock
-        with contextlib.suppress(Exception):
-            self._path.unlink(missing_ok=True)
-        with contextlib.suppress(Exception):
-            self._metadata_path.unlink(missing_ok=True)
-        return True
-
-    def _write_metadata(self) -> None:
-        payload = {
-            "pid": self._pid,
-            "created_ts": time.time(),
-        }
-        self._metadata_path.write_text(json.dumps(payload), encoding="utf-8")
-        return None
+    @property
+    def was_abandoned(self) -> bool:
+        """Returns True if lock was acquired from abandoned state (previous holder crashed)."""
+        return self._was_abandoned
 
     async def __aexit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object) -> None:
-        if self._held:
-            # Release the file lock first
+        if self._held and self._cross_process_lock is not None:
+            # Release the cross-process lock synchronously - it's very fast
+            # and we don't want thread pool issues to delay lock release
             with contextlib.suppress(Exception):
-                await _to_thread(self._lock.release)
-
-            # Small delay on Windows to ensure file handles are released
-            if sys.platform == 'win32':
-                await asyncio.sleep(0.01)
-
-            # Delete metadata file
-            with contextlib.suppress(Exception):
-                await _to_thread(self._metadata_path.unlink, missing_ok=True)
-
-            # Delete lock file
-            with contextlib.suppress(Exception):
-                await _to_thread(self._path.unlink, missing_ok=True)
-
+                self._cross_process_lock.release()
             self._held = False
 
         # Clean up process-level locks
         if self._loop_key is not None:
             _PROCESS_LOCK_OWNERS.pop(self._loop_key, None)
+            _PROCESS_LOCK_INFO.pop(self._loop_key, None)
+            _HELD_CROSS_PROCESS_LOCKS.pop(self._loop_key, None)
+            _LOCK_HOLDER_TASKS.pop(self._loop_key, None)
+
         if self._process_lock_held and self._process_lock:
             self._process_lock.release()
             self._process_lock_held = False
+
         if (
             self._loop_key is not None
             and self._process_lock
             and not self._process_lock.locked()
         ):
             _PROCESS_LOCKS.pop(self._loop_key, None)
+
         self._process_lock = None
         self._loop_key = None
-        return None
-
-    @staticmethod
-    def _pid_alive(pid: int) -> bool:
-        """Check if a process with the given PID is alive (cross-platform)."""
-        if pid <= 0:
-            return False
-
-        # Try psutil first if available (most reliable cross-platform method)
-        try:
-            import psutil  # type: ignore[import-not-found]
-            return bool(psutil.pid_exists(pid))
-        except ImportError:
-            pass
-
-        # Platform-specific fallbacks
-        if sys.platform == 'win32':
-            # Windows: Use ctypes to call OpenProcess
-            try:
-                import ctypes
-                kernel32 = ctypes.windll.kernel32
-                PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-                SYNCHRONIZE = 0x00100000
-                # Try to open the process with minimal permissions
-                handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, pid)
-                if handle:
-                    kernel32.CloseHandle(handle)
-                    return True
-                return False
-            except Exception:
-                # If ctypes fails, assume process doesn't exist
-                return False
-        else:
-            # Unix/Linux/macOS: Use os.kill(pid, 0)
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                return False
-            except PermissionError:
-                # Process exists but we don't have permission to signal it
-                return True
-            except OSError:
-                return False
-            return True
+        self._cross_process_lock = None
 
 
 @asynccontextmanager
@@ -728,7 +1032,7 @@ def collect_lock_status(settings: Settings) -> dict[str, Any]:
                 with contextlib.suppress(Exception):
                     pid_int = int(pid_val)
             info["owner_pid"] = pid_int
-            info["owner_alive"] = AsyncFileLock._pid_alive(pid_int) if pid_int else False
+            info["owner_alive"] = _pid_alive(pid_int) if pid_int else False
 
             created_ts = metadata.get("created_ts") if isinstance(metadata, dict) else None
             if isinstance(created_ts, (int, float)):
@@ -738,7 +1042,7 @@ def collect_lock_status(settings: Settings) -> dict[str, Any]:
                 info["created_ts"] = None
                 info["age_seconds"] = None
 
-            stale_threshold = AsyncFileLock(lock_path)._stale_timeout
+            stale_threshold = 180.0  # Default stale timeout
             info["stale_timeout_seconds"] = stale_threshold
             age_val = info.get("age_seconds")
             # Lock is stale if EITHER the owner is dead OR the age exceeds timeout
@@ -1278,19 +1582,28 @@ async def heal_archive_locks(settings: Settings) -> dict[str, Any]:
     if not root.exists():
         return summary
 
-    # --- Phase 1: Clean application-level locks ---
+    # --- Phase 1: Clean stale application-level lock files ---
+    # Note: With Named Mutex, these files should no longer be created,
+    # but we clean up any legacy files for backward compatibility
     for lock_path_raw in sorted(root.rglob("*.lock"), key=str):
         lock_path = Path(str(lock_path_raw))
         # Skip Git internal locks - handled separately in Phase 2
         if ".git" in lock_path.parts:
             continue
         summary["locks_scanned"] += 1
+        # Check if this is a stale lock file (no owner or dead owner)
+        metadata_path = lock_path.parent / f"{lock_path.name}.owner.json"
         try:
-            lock = AsyncFileLock(lock_path, timeout_seconds=0.0, stale_timeout_seconds=0.0)
-            removed = await _to_thread(lock._cleanup_if_stale, _timeout=5.0)
-            if removed:
-                summary["locks_removed"].append(str(lock_path))
-        except FileNotFoundError:
+            if metadata_path.exists():
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                pid = metadata.get("pid")
+                if pid is not None and _pid_alive(int(pid)):
+                    continue  # Lock is still active
+            # Remove stale lock file
+            lock_path.unlink(missing_ok=True)
+            metadata_path.unlink(missing_ok=True)
+            summary["locks_removed"].append(str(lock_path))
+        except (FileNotFoundError, PermissionError, json.JSONDecodeError):
             continue
 
     # --- Phase 2: Clean orphaned metadata files ---
