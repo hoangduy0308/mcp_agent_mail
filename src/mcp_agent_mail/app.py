@@ -65,7 +65,12 @@ from .storage import (
     write_agent_profile,
     write_message_bundle,
 )
-from .utils import generate_agent_name, sanitize_agent_name, slugify, validate_agent_name_format
+from .utils import (
+    generate_agent_name,
+    sanitize_agent_name,
+    slugify,
+    validate_agent_name_format,
+)
 import contextlib
 
 logger = logging.getLogger(__name__)

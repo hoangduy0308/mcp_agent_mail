@@ -17,13 +17,14 @@ from urllib.parse import urlparse
 
 import litellm
 import structlog
-from decouple import Config as DecoupleConfig, RepositoryEnv  # type: ignore[import-untyped]
+from decouple import Config as DecoupleConfig, RepositoryEnv
 from litellm.types.caching import LiteLLMCacheType
 
 from .config import get_settings
 
 _router: Optional[Any] = None
 _init_lock = asyncio.Lock()
+_initialized: bool = False
 _logger = structlog.get_logger(__name__)
 
 
@@ -82,11 +83,11 @@ def _setup_callbacks() -> None:
 
 
 async def _ensure_initialized() -> None:
-    global _router
-    if _router is not None:
+    global _router, _initialized
+    if _initialized:
         return
     async with _init_lock:
-        if _router is not None:
+        if _initialized:
             return
         settings = get_settings()
 
@@ -98,9 +99,7 @@ async def _ensure_initialized() -> None:
 
         # Enable cache globally (in-memory or Redis) using LiteLLM's API
         if settings.llm.cache_enabled:
-            from contextlib import suppress
-
-            with suppress(Exception):
+            with contextlib.suppress(Exception):
                 backend = (getattr(settings.llm, "cache_backend", "local") or "local").lower()
                 if backend == "redis" and getattr(settings.llm, "cache_redis_url", ""):
                     parsed = urlparse(settings.llm.cache_redis_url)
@@ -128,6 +127,7 @@ async def _ensure_initialized() -> None:
         # Router is designed for load balancing across multiple deployments with a model_list,
         # but we're just using single API keys, so direct completion is simpler and works fine.
         _router = None
+        _initialized = True
 
 
 def _choose_best_available_model(preferred: str) -> str:
@@ -144,7 +144,7 @@ def _choose_best_available_model(preferred: str) -> str:
 
     # Alias unsupported placeholder to sensible defaults by provider key presence
     if env.get("OPENAI_API_KEY"):
-        return "gpt-5-mini"
+        return "gpt-4o-mini"
     if env.get("GOOGLE_API_KEY"):
         return "gemini-1.5-flash"
     if env.get("ANTHROPIC_API_KEY"):
@@ -158,14 +158,14 @@ def _choose_best_available_model(preferred: str) -> str:
         return "xai/grok-2-mini"
     if env.get("OPENROUTER_API_KEY"):
         # OpenRouter requires qualified model ids; choose a widely available one
-        return "openrouter/openai/gpt-5-mini"
+        return "openrouter/openai/gpt-4o-mini"
     return preferred
 
 
 def _resolve_model_alias(name: str) -> str:
     """Map known placeholder or project-specific names to concrete provider models."""
     normalized = (name or "").strip().lower()
-    if normalized in {"gpt-5-mini", "gpt5-mini", "gpt-5m"}:
+    if normalized in {"gpt-5-mini", "gpt5-mini", "gpt-5m", "gpt-4o-mini"}:
         return _choose_best_available_model(normalized)
     return name
 
@@ -234,13 +234,13 @@ def _bridge_provider_env() -> None:
     Also map common synonyms to LiteLLM's canonical env names, e.g. GEMINI_API_KEY -> GOOGLE_API_KEY,
     GROK_API_KEY -> XAI_API_KEY.
     """
-    from decouple import RepositoryEmpty  # type: ignore[import-untyped]
+    from decouple import RepositoryEmpty
 
     # Gracefully handle missing .env file (e.g., in CI/tests)
     try:
         cfg = DecoupleConfig(RepositoryEnv(".env"))
     except FileNotFoundError:
-        cfg = DecoupleConfig(RepositoryEmpty())  # type: ignore[arg-type]
+        cfg = DecoupleConfig(RepositoryEmpty())
 
     def _get_from_any(*keys: str) -> str:
         for k in keys:
@@ -272,5 +272,4 @@ def _bridge_provider_env() -> None:
             val = _get_from_any(*aliases)
             if val:
                 os.environ[canonical] = val
-
 

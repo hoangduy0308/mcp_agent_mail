@@ -29,7 +29,16 @@ import typer
 import uvicorn
 from rich.console import Console
 from rich.table import Table
-from sqlalchemy import and_, asc, bindparam, desc, func, or_, select, text
+from sqlalchemy import (
+    and_,
+    asc as _sa_asc,
+    bindparam,
+    desc as _sa_desc,
+    func,
+    or_ as _sa_or,
+    select as _sa_select,
+    text,
+)
 from sqlalchemy.engine import make_url
 from sqlalchemy.sql import ColumnElement
 
@@ -72,6 +81,23 @@ ARCHIVE_STORAGE_DIRNAME = Path("storage_repo")
 DEFAULT_ARCHIVE_SCRUB_PRESET = "archive"
 app = typer.Typer(help="Developer utilities for the MCP Agent Mail service.")
 
+# ty currently struggles to type SQLModel-mapped SQLAlchemy expressions.
+# Provide lightweight wrappers to keep type checking focused on our code.
+def select(*entities: Any, **kwargs: Any) -> Any:
+    return _sa_select(*entities, **kwargs)
+
+
+def or_(*clauses: Any) -> Any:
+    return _sa_or(*clauses)
+
+
+def asc(value: Any) -> Any:
+    return _sa_asc(value)
+
+
+def desc(value: Any) -> Any:
+    return _sa_desc(value)
+
 _PREVIEW_FORCE_TOKEN = 0
 _PREVIEW_FORCE_LOCK = threading.Lock()
 
@@ -98,6 +124,8 @@ products_app = typer.Typer(help="Product Bus: manage products and links")
 app.add_typer(products_app, name="products")
 docs_app = typer.Typer(help="Documentation helpers for agent onboarding")
 app.add_typer(docs_app, name="docs")
+doctor_app = typer.Typer(help="Diagnose and repair mailbox health issues")
+app.add_typer(doctor_app, name="doctor")
 
 
 async def _get_project_record(identifier: str) -> Project:
@@ -139,6 +167,18 @@ def _iso(dt: Optional[datetime]) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
 
+def _ensure_utc_dt(dt: Optional[datetime]) -> Optional[datetime]:
+    """Ensure datetime is timezone-aware UTC.
+
+    Naive datetimes (from SQLite) are assumed to be UTC already.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 @products_app.command("ensure")
 def products_ensure(
     product_key: Annotated[Optional[str], typer.Argument(help="Product uid or name")] = None,
@@ -153,7 +193,7 @@ def products_ensure(
     # Prefer server tool to ensure consistent uid policy
     settings = get_settings()
     server_url = f"http://{settings.http.host}:{settings.http.port}{settings.http.path}"
-    bearer = settings.http.bearer_token or os.environ.get("HTTP_BEARER_TOKEN", "")
+    bearer = settings.http.bearer_token or ""
     resp_data: dict[str, Any] = {}
     try:
         with httpx.Client(timeout=5.0) as client:
@@ -318,7 +358,7 @@ def products_search(
                 raise typer.BadParameter(f"Product '{product_key}' not found.")
             assert prod.id is not None
             rows = await session.execute(
-                select(ProductProjectLink.project_id).where(cast(ColumnElement[bool], ProductProjectLink.product_id == prod.id))  # type: ignore[call-overload]
+                select(ProductProjectLink.project_id).where(cast(ColumnElement[bool], ProductProjectLink.product_id == prod.id))
             )
             proj_ids = [int(r[0]) for r in rows.fetchall()]
             if not proj_ids:
@@ -373,7 +413,7 @@ def products_inbox(
     """
     settings = get_settings()
     server_url = f"http://{settings.http.host}:{settings.http.port}{settings.http.path}"
-    bearer = settings.http.bearer_token or os.environ.get("HTTP_BEARER_TOKEN", "")
+    bearer = settings.http.bearer_token or ""
     # Try server first
     try:
         with httpx.Client(timeout=5.0) as client:
@@ -427,7 +467,7 @@ def products_inbox(
                     from sqlalchemy.orm import aliased as _aliased  # local to avoid top-level churn
                     sender_alias = _aliased(Agent)
                     stmt = (
-                        select(Message, MessageRecipient.kind, sender_alias.name)  # type: ignore[call-overload]
+                        select(Message, MessageRecipient.kind, sender_alias.name)
                         .join(MessageRecipient, cast(ColumnElement[bool], MessageRecipient.message_id == Message.id))
                         .join(sender_alias, cast(ColumnElement[bool], Message.sender_id == sender_alias.id))
                         .where(and_(cast(ColumnElement[bool], Message.project_id == proj.id), cast(ColumnElement[bool], MessageRecipient.agent_id == agent_row.id)))
@@ -495,7 +535,7 @@ def products_summarize_thread(
     """
     settings = get_settings()
     server_url = f"http://{settings.http.host}:{settings.http.port}{settings.http.path}"
-    bearer = settings.http.bearer_token or os.environ.get("HTTP_BEARER_TOKEN", "")
+    bearer = settings.http.bearer_token or ""
     # Try server
     try:
         with httpx.Client(timeout=8.0) as client:
@@ -624,6 +664,44 @@ def serve_http(
     if "ws" in _sig.parameters:
         _kwargs["ws"] = "none"
     uvicorn.run(app, **_kwargs)
+
+
+@app.command("serve-stdio")
+def serve_stdio() -> None:
+    """Run the MCP server over stdio transport for CLI integration.
+
+    This transport communicates via stdin/stdout, making it suitable for
+    integrations where the host process (e.g., Claude Code) spawns and manages
+    the MCP server directly. This enables project-local installation patterns
+    without requiring a separate HTTP server.
+
+    Note: All logging is redirected to stderr to avoid corrupting the stdio protocol.
+    Tool debug panels are automatically disabled in stdio mode.
+    """
+    import logging
+
+    from .config import clear_settings_cache
+
+    # Disable tool debug logging and rich console output - they output to stdout
+    # and would corrupt the stdio protocol
+    os.environ["TOOLS_LOG_ENABLED"] = "false"
+    os.environ["LOG_RICH_ENABLED"] = "false"
+    clear_settings_cache()
+
+    # Redirect all logging to stderr to avoid corrupting stdio transport
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        stream=sys.stderr,
+    )
+
+    # Print startup message to stderr (stdout is reserved for MCP protocol)
+    print("MCP Agent Mail - Starting stdio transport...", file=sys.stderr)
+
+    server = build_mcp_server()
+    server.run(transport="stdio")
 
 
 def _run_command(command: list[str]) -> None:
@@ -1146,15 +1224,15 @@ def _start_preview_server(bundle_path: Path, host: str, port: int) -> ThreadingH
     bundle_path = bundle_path.resolve()
 
     class PreviewRequestHandler(SimpleHTTPRequestHandler):
-        def __init__(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        def __init__(self, *args, **kwargs):
             super().__init__(*args, directory=str(bundle_path), **kwargs)
 
-        def end_headers(self) -> None:  # type: ignore[override]
+        def end_headers(self) -> None:
             self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
             self.send_header("Pragma", "no-cache")
             super().end_headers()
 
-        def do_GET(self) -> None:  # type: ignore[override]
+        def do_GET(self) -> None:
             if self.path.startswith("/__preview__/status"):
                 payload = _collect_preview_status(bundle_path)
                 data = json.dumps(payload).encode("utf-8")
@@ -1479,12 +1557,12 @@ def share_preview(
     actual_host = actual_host or host
 
     console.rule("[bold]Static Bundle Preview[/bold]")
-    console.print(f"Serving {bundle_path} at http://{actual_host}:{actual_port}/ (Ctrl+C to stop)")  # type: ignore[str-bytes-safe]
+    console.print(f"Serving {bundle_path} at http://{actual_host}:{actual_port}/ (Ctrl+C to stop)")
     console.print("[dim]Commands: press 'r' to force refresh, 'd' to deploy now, 'q' to stop.[/]")
 
     if open_browser:
         with suppress(Exception):
-            webbrowser.open(f"http://{actual_host}:{actual_port}/viewer/")  # type: ignore[str-bytes-safe]
+            webbrowser.open(f"http://{actual_host}:{actual_port}/viewer/")
 
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -2430,7 +2508,7 @@ def list_projects(
             if include_agents:
                 for project in projects:
                     count_result = await session.execute(
-                        select(func.count(Agent.id)).where(Agent.project_id == project.id)  # type: ignore[arg-type]
+                        select(func.count(Agent.id)).where(Agent.project_id == project.id)
                     )
                     count = int(count_result.scalar_one())
                     rows.append((project, count))
@@ -2558,14 +2636,14 @@ def file_reservations_list(
             raise ValueError("Project must have an id")
         await ensure_schema()
         async with get_session() as session:
-            stmt = select(FileReservation, Agent.name).join(Agent, cast(ColumnElement[bool], FileReservation.agent_id == Agent.id)).where(  # type: ignore[call-overload]
+            stmt = select(FileReservation, Agent.name).join(Agent, cast(ColumnElement[bool], FileReservation.agent_id == Agent.id)).where(
                 cast(ColumnElement[bool], FileReservation.project_id == project_record.id)
             )
             if active_only:
                 stmt = stmt.where(cast(ColumnElement[bool], cast(Any, FileReservation.released_ts).is_(None)))
             stmt = stmt.order_by(asc(cast(Any, FileReservation.expires_ts)))
-            rows = (await session.execute(stmt)).all()
-        return project_record, rows  # type: ignore[return-value]
+            rows = [(row[0], row[1]) for row in (await session.execute(stmt)).all()]
+        return project_record, rows
 
     try:
         project_record, rows = asyncio.run(_run())
@@ -2601,7 +2679,7 @@ def amctl_env(
     p = project_path.expanduser().resolve()
     agent_name = agent or os.environ.get("AGENT_NAME") or "Unknown"
     # Reuse server helper for identity
-    from mcp_agent_mail.app import _resolve_project_identity as _resolve_ident  # type: ignore
+    from mcp_agent_mail.app import _resolve_project_identity as _resolve_ident
     ident = _resolve_ident(str(p))
     slug = ident["slug"]
     project_uid = ident["project_uid"]
@@ -2653,7 +2731,7 @@ def am_run(
     """
     p = project_path.expanduser().resolve()
     agent_name = agent or os.environ.get("AGENT_NAME") or "Unknown"
-    from mcp_agent_mail.app import _resolve_project_identity as _resolve_ident  # type: ignore
+    from mcp_agent_mail.app import _resolve_project_identity as _resolve_ident
     ident = _resolve_ident(str(p))
     slug = ident["slug"]
     project_uid = ident["project_uid"]
@@ -2679,7 +2757,7 @@ def am_run(
     guard_mode = (os.environ.get("AGENT_MAIL_GUARD_MODE", "block") or "block").strip().lower()
     worktrees_enabled = bool(settings.worktrees_enabled)
     server_url = f"http://{settings.http.host}:{settings.http.port}{settings.http.path}"
-    bearer = settings.http.bearer_token or os.environ.get("HTTP_BEARER_TOKEN", "")
+    bearer = settings.http.bearer_token or ""
 
     def _safe_component(value: str) -> str:
         s = value.strip()
@@ -2928,7 +3006,7 @@ def projects_mark_identity(
     Write the current project_uid into a marker file (.agent-mail-project-id).
     """
     p = project_path.expanduser().resolve()
-    from mcp_agent_mail.app import _resolve_project_identity as _resolve_ident  # type: ignore
+    from mcp_agent_mail.app import _resolve_project_identity as _resolve_ident
     ident = _resolve_ident(str(p))
     uid = ident.get("project_uid") or ""
     if not uid:
@@ -2966,7 +3044,7 @@ def projects_discovery_init(
     Scaffold a discovery YAML file (.agent-mail.yaml) with project_uid (and optional product_uid).
     """
     p = project_path.expanduser().resolve()
-    from mcp_agent_mail.app import _resolve_project_identity as _resolve_ident  # type: ignore
+    from mcp_agent_mail.app import _resolve_project_identity as _resolve_ident
     ident = _resolve_ident(str(p))
     uid = ident.get("project_uid") or ""
     if not uid:
@@ -3042,7 +3120,7 @@ def mail_status(
                 repo.close()
 
     # Compute a candidate slug using the same logic as the server helper (summarized)
-    from mcp_agent_mail.app import _compute_project_slug as _compute_slug  # type: ignore
+    from mcp_agent_mail.app import _compute_project_slug as _compute_slug
     slug_value = _compute_slug(str(p))
 
     table = Table(title="Mail routing status", show_lines=False)
@@ -3140,7 +3218,7 @@ def guard_check(
 
     # Map repo path to project archive
     try:
-        from mcp_agent_mail.app import _compute_project_slug as _compute_slug  # type: ignore
+        from mcp_agent_mail.app import _compute_project_slug as _compute_slug
     except Exception:
         console.print("[red]Internal error: cannot import slug helper.[/]")
         raise typer.Exit(code=1) from None
@@ -3168,16 +3246,18 @@ def guard_check(
     if ic and ic.strip().lower() == "true":
         ignorecase = True
     try:
-        from pathspec import PathSpec as _PS  # type: ignore
+        from pathspec import PathSpec as _PathSpecImport
     except Exception:
-        _PS = None  # type: ignore
+        _PS = None
+    else:
+        _PS = _PathSpecImport
     import fnmatch as _fn
 
     def _normalize(p: str) -> str:
         s = p.replace("\\", "/").lstrip("/")
         return s.lower() if ignorecase else s
 
-    def _compile(pattern: str):  # type: ignore[no-untyped-def]
+    def _compile(pattern: str):
         patt = pattern.lower() if ignorecase else pattern
         if _PS is not None:
             try:
@@ -3186,7 +3266,7 @@ def guard_check(
                 return None
         return None
 
-    def _match(spec, a: str, b: str) -> bool:  # type: ignore[no-untyped-def]
+    def _match(spec, a: str, b: str) -> bool:
         aa = _normalize(a)
         bb = _normalize(b)
         if spec is not None:
@@ -3253,7 +3333,7 @@ def projects_adopt(
 
     try:
         async def _both() -> tuple[Project, Project]:
-            return await asyncio.gather(_load(source), _load(target))  # type: ignore[return-value]
+            return await asyncio.gather(_load(source), _load(target))
         src, dst = asyncio.run(_both())
     except Exception as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -3305,19 +3385,21 @@ def projects_adopt(
         # Detect agent name conflicts
         await ensure_schema()
         async with get_session() as session:
-            src_agents = [row[0] for row in (await session.execute(select(Agent.name).where(cast(ColumnElement[bool], Agent.project_id == src.id)))).all()]  # type: ignore[call-overload]
-            dst_agents = [row[0] for row in (await session.execute(select(Agent.name).where(cast(ColumnElement[bool], Agent.project_id == dst.id)))).all()]  # type: ignore[call-overload]
+            src_agents = [row[0] for row in (await session.execute(select(Agent.name).where(cast(ColumnElement[bool], Agent.project_id == src.id)))).all()]
+            dst_agents = [row[0] for row in (await session.execute(select(Agent.name).where(cast(ColumnElement[bool], Agent.project_id == dst.id)))).all()]
             dup = sorted(set(src_agents).intersection(set(dst_agents)))
             if dup:
                 raise typer.BadParameter(f"Agent name conflicts in target project: {', '.join(dup)}")
         # Move Git artifacts
         settings = get_settings()
         # local import to minimize top-level churn and keep ordering stable
-        from .storage import AsyncFileLock as _AsyncFileLock, ensure_archive as _ensure_archive  # type: ignore
+        from .storage import AsyncFileLock as _AsyncFileLock, ensure_archive as _ensure_archive
         src_archive = asyncio.run(_ensure_archive(settings, src.slug))
         dst_archive = asyncio.run(_ensure_archive(settings, dst.slug))
         moved_relpaths: list[str] = []
-        for path in sorted(src_archive.root.rglob("*"), key=str):
+        for path_item in sorted(src_archive.root.rglob("*"), key=str):
+            # rglob returns Path objects at runtime; cast for type checker
+            path = cast(Path, path_item)
             if not path.is_file():
                 continue
             if path.name.endswith(".lock") or path.name.endswith(".lock.owner.json"):
@@ -3329,7 +3411,7 @@ def projects_adopt(
                 continue
             await asyncio.to_thread(path.replace, dest_path)
             moved_relpaths.append(dest_path.relative_to(dst_archive.repo_root).as_posix())
-        from .storage import _commit as _archive_commit  # type: ignore
+        from .storage import _commit as _archive_commit
         async with _AsyncFileLock(dst_archive.lock_path):
             await _archive_commit(dst_archive.repo, settings, f"adopt: move {src.slug} into {dst.slug}", moved_relpaths)
         # Re-key database rows (agents, messages, file_reservations)
@@ -3375,14 +3457,14 @@ def file_reservations_active(
         await ensure_schema()
         async with get_session() as session:
             stmt = (
-                select(FileReservation, Agent.name)  # type: ignore[call-overload]
+                select(FileReservation, Agent.name)
                 .join(Agent, cast(ColumnElement[bool], FileReservation.agent_id == Agent.id))
                 .where(and_(cast(ColumnElement[bool], FileReservation.project_id == project_record.id), cast(ColumnElement[bool], cast(Any, FileReservation.released_ts).is_(None))))
                 .order_by(asc(cast(Any, FileReservation.expires_ts)))
                 .limit(limit)
             )
-            rows = (await session.execute(stmt)).all()
-        return project_record, rows  # type: ignore[return-value]
+            rows = [(row[0], row[1]) for row in (await session.execute(stmt)).all()]
+        return project_record, rows
 
     try:
         project_record, rows = asyncio.run(_run())
@@ -3415,7 +3497,7 @@ def file_reservations_active(
             file_reservation.path_pattern,
             "yes" if file_reservation.exclusive else "no",
             _iso(file_reservation.expires_ts),
-            _fmt_delta(file_reservation.expires_ts),
+            _fmt_delta(_ensure_utc_dt(file_reservation.expires_ts) or file_reservation.expires_ts),
         )
     console.print(table)
 
@@ -3434,7 +3516,7 @@ def file_reservations_soon(
         await ensure_schema()
         async with get_session() as session:
             stmt = (
-                select(FileReservation, Agent.name)  # type: ignore[call-overload]
+                select(FileReservation, Agent.name)
                 .join(Agent, cast(ColumnElement[bool], FileReservation.agent_id == Agent.id))
                 .where(
                     and_(
@@ -3444,8 +3526,8 @@ def file_reservations_soon(
                 )
                 .order_by(asc(cast(Any, FileReservation.expires_ts)))
             )
-            rows = (await session.execute(stmt)).all()
-        return project_record, rows  # type: ignore[return-value]
+            rows = [(row[0], row[1]) for row in (await session.execute(stmt)).all()]
+        return project_record, rows
 
     try:
         project_record, rows = asyncio.run(_run())
@@ -3454,7 +3536,7 @@ def file_reservations_soon(
 
     now = datetime.now(timezone.utc)
     cutoff = now + timedelta(minutes=minutes)
-    soon = [(c, a) for (c, a) in rows if c.expires_ts <= cutoff]
+    soon = [(c, a) for (c, a) in rows if (_ensure_utc_dt(c.expires_ts) or c.expires_ts) <= cutoff]
 
     table = Table(title=f"File Reservations expiring within {minutes}m — {project_record.human_key}", show_lines=False)
     table.add_column("ID")
@@ -3480,7 +3562,7 @@ def file_reservations_soon(
             file_reservation.path_pattern,
             "yes" if file_reservation.exclusive else "no",
             _iso(file_reservation.expires_ts),
-            _fmt_delta(file_reservation.expires_ts),
+            _fmt_delta(_ensure_utc_dt(file_reservation.expires_ts) or file_reservation.expires_ts),
         )
     console.print(table)
 
@@ -3500,7 +3582,7 @@ def acks_pending(
         await ensure_schema()
         async with get_session() as session:
             stmt = (
-                select(Message, MessageRecipient.read_ts, MessageRecipient.ack_ts, MessageRecipient.kind)  # type: ignore[call-overload]
+                select(Message, MessageRecipient.read_ts, MessageRecipient.ack_ts, MessageRecipient.kind)
                 .join(MessageRecipient, cast(ColumnElement[bool], MessageRecipient.message_id == Message.id))
                 .where(
                     and_(
@@ -3513,8 +3595,8 @@ def acks_pending(
                 .order_by(desc(cast(Any, Message.created_ts)))
                 .limit(limit)
             )
-            rows = (await session.execute(stmt)).all()
-        return project_record, agent_record, rows  # type: ignore[return-value]
+            rows = [(row[0], row[1], row[2], row[3]) for row in (await session.execute(stmt)).all()]
+        return project_record, agent_record, rows
 
     try:
         project_record, agent_record, rows = asyncio.run(_run())
@@ -3572,7 +3654,7 @@ def acks_remind(
         await ensure_schema()
         async with get_session() as session:
             stmt = (
-                select(Message, MessageRecipient.read_ts, MessageRecipient.ack_ts, MessageRecipient.kind)  # type: ignore[call-overload]
+                select(Message, MessageRecipient.read_ts, MessageRecipient.ack_ts, MessageRecipient.kind)
                 .join(MessageRecipient, cast(ColumnElement[bool], MessageRecipient.message_id == Message.id))
                 .where(
                     and_(
@@ -3585,8 +3667,8 @@ def acks_remind(
                 .order_by(asc(cast(Any, Message.created_ts)))  # oldest first
                 .limit(limit)
             )
-            rows = (await session.execute(stmt)).all()
-        return project_record, agent_record, rows  # type: ignore[return-value]
+            rows = [(row[0], row[1], row[2], row[3]) for row in (await session.execute(stmt)).all()]
+        return project_record, agent_record, rows
 
     try:
         _project_record, agent_record, rows = asyncio.run(_run())
@@ -3649,7 +3731,7 @@ def acks_overdue(
         async with get_session() as session:
             cutoff = datetime.now(timezone.utc) - timedelta(minutes=ttl_minutes)
             stmt = (
-                select(Message, MessageRecipient.kind)  # type: ignore[call-overload]
+                select(Message, MessageRecipient.kind)
                 .join(MessageRecipient, cast(ColumnElement[bool], MessageRecipient.message_id == Message.id))
                 .where(
                     and_(
@@ -3663,8 +3745,8 @@ def acks_overdue(
                 .order_by(asc(cast(Any, Message.created_ts)))
                 .limit(limit)
             )
-            rows = (await session.execute(stmt)).all()
-        return project_record, agent_record, rows  # type: ignore[return-value]
+            rows = [(row[0], row[1]) for row in (await session.execute(stmt)).all()]
+        return project_record, agent_record, rows
 
     try:
         project_record, agent_record, rows = asyncio.run(_run())
@@ -3730,7 +3812,7 @@ def list_acks(
                 raise typer.BadParameter(f"Agent '{agent_name}' not found in project '{project.human_key}'")
             assert agent.id is not None
             rows = await session.execute(
-                select(Message, MessageRecipient.kind)  # type: ignore[call-overload]
+                select(Message, MessageRecipient.kind)
                 .join(MessageRecipient, cast(ColumnElement[bool], MessageRecipient.message_id == Message.id))
                 .where(
                     and_(
@@ -3743,7 +3825,7 @@ def list_acks(
                 .order_by(desc(cast(Any, Message.created_ts)))
                 .limit(limit)
             )
-            return rows.all()  # type: ignore[return-value]
+            return [(row[0], row[1]) for row in rows.all()]
 
     console.rule("[bold blue]Ack-required Messages")
     rows = asyncio.run(_collect())
@@ -3952,7 +4034,7 @@ def _iter_doc_files(base: Path, max_depth: int) -> Iterable[Path]:
             dirnames[:] = []
         dirnames[:] = [d for d in dirnames if d not in SKIP_SCAN_DIRS]
         for name in filenames:
-            if cast(str, name).upper() in TARGET_DOC_FILENAMES:
+            if name.upper() in TARGET_DOC_FILENAMES:
                 yield Path(dirpath) / name
 
 
@@ -4063,6 +4145,548 @@ def docs_insert_blurbs(
             f"\n[cyan]Summary:[/cyan] inserted into {inserted} file(s); skipped {skipped} file(s); "
             "other files already had the snippet."
         )
+
+
+# =============================================================================
+# Doctor Commands - Diagnose and repair mailbox health
+# =============================================================================
+
+
+@dataclass
+class DiagnosticResult:
+    """Result of a single diagnostic check."""
+
+    name: str
+    status: str  # "ok", "warning", "error", "info"
+    message: str
+    details: list[str] | None = None
+    repair_available: bool = False
+
+
+@doctor_app.command("check")
+def doctor_check(
+    project: Annotated[
+        Optional[str],
+        typer.Argument(help="Project slug or human key (optional - checks all if not specified)"),
+    ] = None,
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show detailed diagnostic output"),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+) -> None:
+    """Run comprehensive diagnostics on mailbox and agent state.
+
+    Checks:
+    - Lock files (stale archive/commit locks)
+    - Database integrity (FK constraints, FTS index, orphaned records)
+    - Archive-DB synchronization
+    - File reservations (expired, conflicts)
+    - Attachments (orphaned files/manifests)
+    """
+
+    async def _run() -> list[DiagnosticResult]:
+        from .db import get_database_path
+
+        settings = get_settings()
+        await ensure_schema()
+        results: list[DiagnosticResult] = []
+
+        # Check 1: Stale locks
+        from .storage import collect_lock_status
+
+        lock_status = collect_lock_status(settings)
+        stale_locks = lock_status.get("stale_locks", [])
+        if stale_locks:
+            results.append(DiagnosticResult(
+                name="Locks",
+                status="warning",
+                message=f"{len(stale_locks)} stale lock(s) found",
+                details=[str(lock) for lock in stale_locks],
+                repair_available=True,
+            ))
+        else:
+            results.append(DiagnosticResult(
+                name="Locks",
+                status="ok",
+                message="No stale locks found",
+            ))
+
+        # Check 2: Database integrity
+        db_path = get_database_path(settings)
+        if db_path and db_path.exists():
+            try:
+                conn = sqlite3.connect(str(db_path))
+                cursor = conn.execute("PRAGMA integrity_check")
+                integrity_result = cursor.fetchone()
+                conn.close()
+                if integrity_result and integrity_result[0] == "ok":
+                    results.append(DiagnosticResult(
+                        name="Database",
+                        status="ok",
+                        message="Database integrity check passed",
+                    ))
+                else:
+                    results.append(DiagnosticResult(
+                        name="Database",
+                        status="error",
+                        message="Database integrity check failed",
+                        details=[str(integrity_result)],
+                        repair_available=False,
+                    ))
+            except Exception as e:
+                results.append(DiagnosticResult(
+                    name="Database",
+                    status="error",
+                    message=f"Database check failed: {e}",
+                ))
+        else:
+            results.append(DiagnosticResult(
+                name="Database",
+                status="info",
+                message="No SQLite database found (may be using different backend)",
+            ))
+
+        # Check 3: Orphaned records
+        async with get_session() as session:
+            # Count orphaned message recipients (no agent)
+            orphan_query = text("""
+                SELECT COUNT(*) FROM message_recipients mr
+                WHERE NOT EXISTS (SELECT 1 FROM agents a WHERE a.id = mr.agent_id)
+            """)
+            result = await session.execute(orphan_query)
+            orphan_count = result.scalar() or 0
+            if orphan_count > 0:
+                results.append(DiagnosticResult(
+                    name="Orphaned Records",
+                    status="warning",
+                    message=f"{orphan_count} orphaned message recipient(s) found",
+                    repair_available=True,
+                ))
+            else:
+                results.append(DiagnosticResult(
+                    name="Orphaned Records",
+                    status="ok",
+                    message="No orphaned records found",
+                ))
+
+            # Check 4: FTS index consistency
+            fts_query = text("""
+                SELECT
+                    (SELECT COUNT(*) FROM messages) as msg_count,
+                    (SELECT COUNT(*) FROM fts_messages) as fts_count
+            """)
+            result = await session.execute(fts_query)
+            counts = result.fetchone()
+            if counts:
+                msg_count, fts_count = counts
+                if msg_count == fts_count:
+                    results.append(DiagnosticResult(
+                        name="FTS Index",
+                        status="ok",
+                        message=f"FTS index synchronized ({msg_count} messages)",
+                    ))
+                else:
+                    results.append(DiagnosticResult(
+                        name="FTS Index",
+                        status="warning",
+                        message=f"FTS index mismatch: {msg_count} messages vs {fts_count} FTS entries",
+                        repair_available=True,
+                    ))
+
+            # Check 5: Expired file reservations
+            # Use naive UTC datetime for consistency with how FileReservation stores timestamps
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            expired_query = select(func.count()).select_from(FileReservation).where(
+                and_(
+                    cast(ColumnElement[bool], cast(Any, FileReservation.released_ts).is_(None)),
+                    cast(ColumnElement[bool], cast(Any, FileReservation.expires_ts) < now),
+                )
+            )
+            result = await session.execute(expired_query)
+            expired_count = result.scalar() or 0
+            if expired_count > 0:
+                results.append(DiagnosticResult(
+                    name="File Reservations",
+                    status="info",
+                    message=f"{expired_count} expired reservation(s) pending cleanup",
+                    repair_available=True,
+                ))
+            else:
+                results.append(DiagnosticResult(
+                    name="File Reservations",
+                    status="ok",
+                    message="No expired reservations",
+                ))
+
+        # Check 6: WAL/journal files
+        if db_path and db_path.exists():
+            wal_path = db_path.with_suffix(".sqlite3-wal")
+            shm_path = db_path.with_suffix(".sqlite3-shm")
+            orphan_files: list[str] = []
+            if wal_path.exists():
+                orphan_files.append(str(wal_path))
+            if shm_path.exists():
+                orphan_files.append(str(shm_path))
+            if orphan_files:
+                results.append(DiagnosticResult(
+                    name="WAL Files",
+                    status="info",
+                    message=f"{len(orphan_files)} WAL/SHM file(s) present (normal during operation)",
+                    details=orphan_files,
+                ))
+            else:
+                results.append(DiagnosticResult(
+                    name="WAL Files",
+                    status="ok",
+                    message="No orphan WAL/SHM files",
+                ))
+
+        return results
+
+    try:
+        diagnostics = asyncio.run(_run())
+    except Exception as exc:
+        if json_output:
+            console.print_json(json.dumps({"error": str(exc)}))
+        else:
+            console.print(f"[red]Error running diagnostics:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if json_output:
+        output = {
+            "diagnostics": [
+                {
+                    "name": d.name,
+                    "status": d.status,
+                    "message": d.message,
+                    "details": d.details,
+                    "repair_available": d.repair_available,
+                }
+                for d in diagnostics
+            ],
+            "summary": {
+                "errors": sum(1 for d in diagnostics if d.status == "error"),
+                "warnings": sum(1 for d in diagnostics if d.status == "warning"),
+                "info": sum(1 for d in diagnostics if d.status == "info"),
+                "ok": sum(1 for d in diagnostics if d.status == "ok"),
+            },
+        }
+        console.print_json(json.dumps(output))
+        return
+
+    # Rich table output
+    console.print("\n[bold cyan]MCP Agent Mail Doctor - Diagnostic Report[/bold cyan]")
+    console.print("=" * 50)
+
+    if project:
+        console.print(f"Project: {project}\n")
+
+    table = Table(show_header=True)
+    table.add_column("Check", style="bold")
+    table.add_column("Status", justify="center")
+    table.add_column("Details")
+
+    status_colors = {
+        "ok": "[green]OK[/green]",
+        "warning": "[yellow]WARN[/yellow]",
+        "error": "[red]ERROR[/red]",
+        "info": "[blue]INFO[/blue]",
+    }
+
+    for diag in diagnostics:
+        status_display = status_colors.get(diag.status, diag.status)
+        details = diag.message
+        if verbose and diag.details:
+            details += "\n" + "\n".join(f"  • {d}" for d in diag.details[:5])
+        table.add_row(diag.name, status_display, details)
+
+    console.print(table)
+
+    # Summary
+    errors = sum(1 for d in diagnostics if d.status == "error")
+    warnings = sum(1 for d in diagnostics if d.status == "warning")
+    info = sum(1 for d in diagnostics if d.status == "info")
+
+    console.print()
+    if errors > 0 or warnings > 0:
+        console.print(f"[bold]Summary:[/bold] {errors} error(s), {warnings} warning(s), {info} info")
+        console.print("\nRun [cyan]am doctor repair[/cyan] to fix issues")
+    else:
+        console.print("[green]All checks passed![/green]")
+
+
+@doctor_app.command("repair")
+def doctor_repair(
+    project: Annotated[
+        Optional[str],
+        typer.Argument(help="Project slug or human key (optional)"),
+    ] = None,
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview changes without executing"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompts"),
+    backup_dir: Annotated[
+        Optional[Path],
+        typer.Option("--backup-dir", help="Directory for backups (default: storage_root/backups)"),
+    ] = None,
+) -> None:
+    """Repair common mailbox issues.
+
+    Semi-automatic mode (default):
+    - Auto-fixes safe issues: stale locks, expired file reservations
+    - Prompts for confirmation on data-affecting repairs
+
+    Creates a backup before any destructive operation.
+    """
+
+    async def _run() -> dict[str, Any]:
+        from .storage import create_diagnostic_backup, heal_archive_locks
+
+        settings = get_settings()
+        await ensure_schema()
+        repair_results: dict[str, Any] = {
+            "backup_path": None,
+            "safe_repairs": [],
+            "data_repairs": [],
+            "errors": [],
+        }
+
+        # Step 1: Create backup before any repairs
+        if not dry_run:
+            console.print("[cyan]Creating backup before repairs...[/cyan]")
+            try:
+                backup_path = await create_diagnostic_backup(
+                    settings,
+                    project_slug=project,
+                    backup_dir=backup_dir,
+                    reason="doctor-repair",
+                )
+                repair_results["backup_path"] = str(backup_path)
+                console.print(f"[green]Backup created:[/green] {backup_path}")
+            except Exception as e:
+                repair_results["errors"].append(f"Backup failed: {e}")
+                console.print(f"[red]Backup failed:[/red] {e}")
+                if not yes and not typer.confirm("Continue without backup?", default=False):
+                    return repair_results
+
+        # Step 2: Safe repairs (auto-applied)
+        console.print("\n[bold]Safe Repairs (auto-applied):[/bold]")
+
+        # 2a: Heal stale locks
+        if dry_run:
+            console.print("  [dim]Would heal stale locks[/dim]")
+            repair_results["safe_repairs"].append({"action": "heal_locks", "dry_run": True})
+        else:
+            try:
+                lock_result = await heal_archive_locks(settings)
+                healed = lock_result.get("healed", 0)
+                if healed > 0:
+                    console.print(f"  [green]Healed {healed} stale lock(s)[/green]")
+                else:
+                    console.print("  [dim]No stale locks to heal[/dim]")
+                repair_results["safe_repairs"].append({"action": "heal_locks", "healed": healed})
+            except Exception as e:
+                repair_results["errors"].append(f"Lock healing failed: {e}")
+                console.print(f"  [red]Lock healing failed:[/red] {e}")
+
+        # 2b: Release expired file reservations
+        async with get_session() as session:
+            # Use naive UTC datetime for consistency with how FileReservation stores timestamps
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            if dry_run:
+                expired_query = select(func.count()).select_from(FileReservation).where(
+                    and_(
+                        cast(ColumnElement[bool], cast(Any, FileReservation.released_ts).is_(None)),
+                        cast(ColumnElement[bool], cast(Any, FileReservation.expires_ts) < now),
+                    )
+                )
+                result = await session.execute(expired_query)
+                count = result.scalar() or 0
+                console.print(f"  [dim]Would release {count} expired reservation(s)[/dim]")
+                repair_results["safe_repairs"].append({"action": "release_expired", "count": count, "dry_run": True})
+            else:
+                # Update expired reservations
+                from sqlalchemy import update
+
+                update_stmt = (
+                    update(FileReservation)
+                    .where(
+                        and_(
+                            cast(ColumnElement[bool], cast(Any, FileReservation.released_ts).is_(None)),
+                            cast(ColumnElement[bool], cast(Any, FileReservation.expires_ts) < now),
+                        )
+                    )
+                    .values(released_ts=now)
+                )
+                result = await session.execute(update_stmt)
+                await session.commit()
+                released = int(getattr(result, "rowcount", 0) or 0)
+                if released > 0:
+                    console.print(f"  [green]Released {released} expired reservation(s)[/green]")
+                else:
+                    console.print("  [dim]No expired reservations to release[/dim]")
+                repair_results["safe_repairs"].append({"action": "release_expired", "released": released})
+
+        # Step 3: Data-affecting repairs (require confirmation)
+        console.print("\n[bold]Data Repairs (require confirmation):[/bold]")
+
+        # 3a: Clean orphaned message recipients
+        async with get_session() as session:
+            orphan_count_query = text("""
+                SELECT COUNT(*) FROM message_recipients mr
+                WHERE NOT EXISTS (SELECT 1 FROM agents a WHERE a.id = mr.agent_id)
+            """)
+            result = await session.execute(orphan_count_query)
+            orphan_count = result.scalar() or 0
+
+            if orphan_count > 0:
+                if dry_run:
+                    console.print(f"  [dim]Would delete {orphan_count} orphaned recipient record(s)[/dim]")
+                    repair_results["data_repairs"].append({"action": "delete_orphans", "count": orphan_count, "dry_run": True})
+                elif yes or typer.confirm(f"  Delete {orphan_count} orphaned message recipient record(s)?", default=False):
+                    delete_query = text("""
+                        DELETE FROM message_recipients
+                        WHERE NOT EXISTS (SELECT 1 FROM agents a WHERE a.id = message_recipients.agent_id)
+                    """)
+                    await session.execute(delete_query)
+                    await session.commit()
+                    console.print(f"  [green]Deleted {orphan_count} orphaned record(s)[/green]")
+                    repair_results["data_repairs"].append({"action": "delete_orphans", "deleted": orphan_count})
+                else:
+                    console.print("  [yellow]Skipped orphan cleanup[/yellow]")
+                    repair_results["data_repairs"].append({"action": "delete_orphans", "skipped": True})
+            else:
+                console.print("  [dim]No orphaned records to clean[/dim]")
+
+        return repair_results
+
+    try:
+        results = asyncio.run(_run())
+    except Exception as exc:
+        console.print(f"[red]Error during repair:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    # Summary
+    console.print("\n[bold]Repair Summary:[/bold]")
+    if results.get("backup_path"):
+        console.print(f"  Backup: {results['backup_path']}")
+    safe_count = len(results.get("safe_repairs", []))
+    data_count = len(results.get("data_repairs", []))
+    error_count = len(results.get("errors", []))
+    console.print(f"  Safe repairs: {safe_count}")
+    console.print(f"  Data repairs: {data_count}")
+    if error_count > 0:
+        console.print(f"  [red]Errors: {error_count}[/red]")
+
+
+@doctor_app.command("backups")
+def doctor_backups(
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+) -> None:
+    """List available diagnostic backups."""
+
+    async def _run() -> list[dict[str, Any]]:
+        from .storage import list_backups
+
+        settings = get_settings()
+        return await list_backups(settings)
+
+    backups = asyncio.run(_run())
+
+    if json_output:
+        console.print_json(json.dumps(backups))
+        return
+
+    if not backups:
+        console.print("[dim]No backups found[/dim]")
+        return
+
+    table = Table(title="Available Backups")
+    table.add_column("Created", style="cyan")
+    table.add_column("Reason")
+    table.add_column("Size", justify="right")
+    table.add_column("Database", justify="center")
+    table.add_column("Bundles", justify="right")
+    table.add_column("Path")
+
+    for backup in backups:
+        size_mb = (backup.get("size_bytes", 0) / 1024 / 1024)
+        table.add_row(
+            backup.get("created_at", "")[:19],
+            backup.get("reason", ""),
+            f"{size_mb:.1f} MB",
+            "[green]Yes[/green]" if backup.get("has_database") else "[dim]No[/dim]",
+            str(backup.get("bundle_count", 0)),
+            backup.get("path", ""),
+        )
+
+    console.print(table)
+
+
+@doctor_app.command("restore")
+def doctor_restore(
+    backup_path: Annotated[
+        Path,
+        typer.Argument(help="Path to backup directory to restore from"),
+    ],
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview what would be restored"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompts"),
+) -> None:
+    """Restore from a diagnostic backup.
+
+    WARNING: This will overwrite current database and archive.
+    A pre-restore backup will be created automatically.
+    """
+    if not backup_path.exists():
+        console.print(f"[red]Backup path not found:[/red] {backup_path}")
+        raise typer.Exit(code=1)
+
+    manifest_path = backup_path / "manifest.json"
+    if not manifest_path.exists():
+        console.print(f"[red]Invalid backup:[/red] No manifest.json found in {backup_path}")
+        raise typer.Exit(code=1)
+
+    # Show backup info
+    with manifest_path.open() as f:
+        manifest = json.load(f)
+
+    console.print("\n[bold cyan]Restore from Backup[/bold cyan]")
+    console.print(f"  Created: {manifest.get('created_at', 'unknown')}")
+    console.print(f"  Reason: {manifest.get('reason', 'unknown')}")
+    console.print(f"  Has database: {'Yes' if manifest.get('database_path') else 'No'}")
+    console.print(f"  Bundles: {len(manifest.get('project_bundles', []))}")
+
+    if dry_run:
+        console.print("\n[yellow]Dry run - no changes will be made[/yellow]")
+
+    if not dry_run and not yes:
+        console.print("\n[red]WARNING:[/red] This will overwrite your current database and archive!")
+        if not typer.confirm("Continue with restore?", default=False):
+            console.print("[yellow]Restore cancelled[/yellow]")
+            return
+
+    async def _run() -> dict[str, Any]:
+        from .storage import restore_from_backup
+
+        settings = get_settings()
+        return await restore_from_backup(settings, backup_path, dry_run=dry_run)
+
+    try:
+        result = asyncio.run(_run())
+    except Exception as exc:
+        console.print(f"[red]Restore failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if dry_run:
+        console.print("\n[bold]Would restore:[/bold]")
+        if result.get("would_restore_database"):
+            console.print("  - Database")
+        for bundle in result.get("would_restore_bundles", []):
+            console.print(f"  - Bundle: {bundle}")
+    else:
+        console.print("\n[bold]Restore complete:[/bold]")
+        if result.get("database_restored"):
+            console.print("  [green]Database restored[/green]")
+        for bundle in result.get("bundles_restored", []):
+            console.print(f"  [green]Bundle restored:[/green] {bundle}")
+        for error in result.get("errors", []):
+            console.print(f"  [red]Error:[/red] {error}")
 
 
 if __name__ == "__main__":

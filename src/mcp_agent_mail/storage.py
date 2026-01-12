@@ -26,6 +26,7 @@ from git.objects.tree import Tree
 from PIL import Image
 
 from .config import Settings
+from .utils import validate_thread_id_format
 
 if TYPE_CHECKING:
     pass
@@ -1352,6 +1353,11 @@ async def _update_thread_digest(
     Uses per-thread lock to prevent race conditions when multiple messages
     to the same thread are sent simultaneously.
     """
+    if not validate_thread_id_format(thread_id):
+        raise ValueError(
+            "Invalid thread_id: must start with an alphanumeric character and contain only "
+            "letters, numbers, '.', '_', or '-' (max 128)."
+        )
     # Acquire per-thread lock to serialize appends to same digest file
     thread_lock = _get_thread_digest_lock(thread_id)
     async with thread_lock:

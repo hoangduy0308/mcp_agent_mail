@@ -36,7 +36,7 @@ def _get_write_lock() -> asyncio.Lock:
 @asynccontextmanager
 async def get_write_lock() -> AsyncIterator[None]:
     """Acquire the global write lock for SQLite write operations.
-    
+
     Use this to serialize write-heavy operations like send_message
     to prevent SQLite lock contention.
     """
