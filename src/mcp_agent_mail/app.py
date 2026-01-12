@@ -60,9 +60,9 @@ from .storage import (
     ensure_archive,
     heal_archive_locks,
     process_attachments,
+    shutdown_git_thread_pool,
     stop_commit_queue,
     write_agent_profile,
-    write_file_reservation_record,
     write_message_bundle,
 )
 from .utils import generate_agent_name, sanitize_agent_name, slugify, validate_agent_name_format
@@ -91,6 +91,46 @@ def _git_repo(path: str | Path, search_parent_directories: bool = True) -> Any:
         if repo is not None:
             with suppress(Exception):
                 repo.close()
+
+
+def _run_git_operation_sync(path: str | Path, operation: Callable[[Any], Any], search_parent_directories: bool = True) -> Any:
+    """Run a synchronous Git operation with proper cleanup.
+
+    This helper is designed to be called via asyncio.to_thread() to avoid blocking
+    the event loop when multiple agents are running concurrently.
+
+    Args:
+        path: Path to the git repository
+        operation: A callable that takes a Repo object and returns a result
+        search_parent_directories: Whether to search parent directories for .git
+
+    Returns:
+        The result of the operation callable
+    """
+    with _git_repo(path, search_parent_directories=search_parent_directories) as repo:
+        return operation(repo)
+
+
+async def _run_git_operation(path: str | Path, operation: Callable[[Any], Any], search_parent_directories: bool = True) -> Any:
+    """Run a Git operation asynchronously without blocking the event loop.
+
+    This wraps synchronous GitPython operations in asyncio.to_thread() to prevent
+    blocking when multiple agents call Git operations concurrently.
+
+    Args:
+        path: Path to the git repository
+        operation: A callable that takes a Repo object and returns a result
+        search_parent_directories: Whether to search parent directories for .git
+
+    Returns:
+        The result of the operation callable
+
+    Usage:
+        branch = await _run_git_operation(path, lambda repo: repo.active_branch.name)
+    """
+    return await asyncio.to_thread(
+        _run_git_operation_sync, path, operation, search_parent_directories
+    )
 
 TOOL_METRICS: defaultdict[str, dict[str, int]] = defaultdict(lambda: {"calls": 0, "errors": 0})
 TOOL_CLUSTER_MAP: dict[str, str] = {}
@@ -475,6 +515,10 @@ def _lifespan_factory(settings: Settings) -> Callable[[FastMCP], AsyncIterator[N
         finally:
             # Gracefully stop the commit queue on shutdown
             await stop_commit_queue()
+            # Shutdown the dedicated Git thread pool
+            shutdown_git_thread_pool()
+            # Clear the repo cache to release file handles
+            clear_repo_cache()
 
     return lifespan  # type: ignore[return-value]
 
@@ -1324,7 +1368,7 @@ def _resolve_project_identity(human_key: str) -> dict[str, Any]:
 
 async def _ensure_project(human_key: str) -> Project:
     await ensure_schema()
-    slug = _compute_project_slug(human_key)
+    slug = await asyncio.to_thread(_compute_project_slug, human_key)
     async with get_session() as session:
         result = await session.execute(select(Project).where(Project.slug == slug))  # type: ignore[arg-type]
         project = result.scalars().first()
@@ -1622,7 +1666,7 @@ def _canonical_project_pair(a_id: int, b_id: int) -> tuple[int, int]:
 
 
 @asynccontextmanager
-async def _archive_write_lock(archive: ProjectArchive, *, timeout_seconds: float = 60.0) -> AsyncIterator[None]:
+async def _archive_write_lock(archive: ProjectArchive, *, timeout_seconds: float = 180.0) -> AsyncIterator[None]:
     try:
         async with archive_write_lock(archive, timeout_seconds=timeout_seconds):
             yield
@@ -2116,8 +2160,8 @@ async def _get_or_create_agent(
             await session.commit()
             await session.refresh(agent)
     archive = await ensure_archive(settings, project.slug)
-    async with _archive_write_lock(archive):
-        await write_agent_profile(archive, _agent_to_dict(agent))
+    # No lock needed - file writes are safe (unique per agent), commits serialized by queue
+    await write_agent_profile(archive, _agent_to_dict(agent))
     return agent
 
 
@@ -2959,120 +3003,135 @@ def build_mcp_server() -> FastMCP:
 
         payload: dict[str, Any] | None = None
 
-        async with _archive_write_lock(archive):
-            # Server-side file_reservations enforcement: block if conflicting active exclusive file_reservation exists
-            if settings.file_reservations_enforcement_enabled:
-                await _expire_stale_file_reservations(project.id or 0)
-                now_ts = datetime.now(timezone.utc)
-                y_dir = now_ts.strftime("%Y")
-                m_dir = now_ts.strftime("%m")
-                candidate_surfaces: list[str] = []
-                candidate_surfaces.append(f"agents/{sender.name}/outbox/{y_dir}/{m_dir}/*.md")
-                for r in to_agents + cc_agents + bcc_agents:
-                    candidate_surfaces.append(f"agents/{r.name}/inbox/{y_dir}/{m_dir}/*.md")
+        # ============================================================
+        # PHASE 1: Pre-lock operations (DB queries, no Git writes)
+        # These don't need the archive lock and can run concurrently
+        # ============================================================
 
-                async with get_session() as session:
-                    rows = await session.execute(
-                        cast(Any, select(FileReservation, Agent.name))  # type: ignore[call-overload]
-                        .join(Agent, cast(Any, FileReservation.agent_id) == Agent.id)
-                        .where(
-                            cast(Any, FileReservation.project_id) == project.id,
-                            cast(Any, FileReservation.released_ts).is_(None),
-                            cast(Any, FileReservation.expires_ts) > now_ts,
-                        )
+        # Server-side file_reservations enforcement: block if conflicting active exclusive file_reservation exists
+        if settings.file_reservations_enforcement_enabled:
+            await _expire_stale_file_reservations(project.id or 0)
+            now_ts = datetime.now(timezone.utc)
+            y_dir = now_ts.strftime("%Y")
+            m_dir = now_ts.strftime("%m")
+            candidate_surfaces: list[str] = []
+            candidate_surfaces.append(f"agents/{sender.name}/outbox/{y_dir}/{m_dir}/*.md")
+            for r in to_agents + cc_agents + bcc_agents:
+                candidate_surfaces.append(f"agents/{r.name}/inbox/{y_dir}/{m_dir}/*.md")
+
+            async with get_session() as session:
+                rows = await session.execute(
+                    cast(Any, select(FileReservation, Agent.name))  # type: ignore[call-overload]
+                    .join(Agent, cast(Any, FileReservation.agent_id) == Agent.id)
+                    .where(
+                        cast(Any, FileReservation.project_id) == project.id,
+                        cast(Any, FileReservation.released_ts).is_(None),
+                        cast(Any, FileReservation.expires_ts) > now_ts,
                     )
-                    active_file_reservations = rows.all()
+                )
+                active_file_reservations = rows.all()
 
-                conflicts: list[dict[str, Any]] = []
-                for surface in candidate_surfaces:
-                    for file_reservation_record, holder_name in active_file_reservations:
-                        if _file_reservations_conflict(file_reservation_record, surface, True, sender):
-                            conflicts.append({
-                                "surface": surface,
-                                "holder": holder_name,
-                                "path_pattern": file_reservation_record.path_pattern,
-                                "exclusive": file_reservation_record.exclusive,
-                                "expires_ts": _iso(file_reservation_record.expires_ts),
-                            })
-                if conflicts:
-                    # Return a structured error payload that clients can surface directly
-                    return {
-                        "error": {
-                            "type": "FILE_RESERVATION_CONFLICT",
-                            "message": "Conflicting active file_reservations prevent message write.",
-                            "conflicts": conflicts,
-                        }
+            conflicts: list[dict[str, Any]] = []
+            for surface in candidate_surfaces:
+                for file_reservation_record, holder_name in active_file_reservations:
+                    if _file_reservations_conflict(file_reservation_record, surface, True, sender):
+                        conflicts.append({
+                            "surface": surface,
+                            "holder": holder_name,
+                            "path_pattern": file_reservation_record.path_pattern,
+                            "exclusive": file_reservation_record.exclusive,
+                            "expires_ts": _iso(file_reservation_record.expires_ts),
+                        })
+            if conflicts:
+                # Return a structured error payload that clients can surface directly
+                return {
+                    "error": {
+                        "type": "FILE_RESERVATION_CONFLICT",
+                        "message": "Conflicting active file_reservations prevent message write.",
+                        "conflicts": conflicts,
                     }
-
-            processed_body, attachments_meta, attachment_files = await process_attachments(
-                archive,
-                body_md,
-                attachment_paths or [],
-                convert_markdown,
-                embed_policy=embed_policy,
-            )
-            # Fallback: if body contains inline data URI, reflect that in attachments meta for API parity
-            if not attachments_meta and ("data:image" in body_md):
-                attachments_meta.append({"type": "inline", "media_type": "image/webp"})
-            message = await _create_message(
-                project,
-                sender,
-                subject,
-                processed_body,
-                recipient_records,
-                importance,
-                ack_required,
-                thread_id,
-                attachments_meta,
-            )
-            frontmatter = _message_frontmatter(
-                message,
-                project,
-                sender,
-                to_agents,
-                cc_agents,
-                bcc_agents,
-                attachments_meta,
-            )
-            recipients_for_archive = [agent.name for agent in to_agents + cc_agents + bcc_agents]
-            payload = _message_to_dict(message)
-            payload.update(
-                {
-                    "from": sender.name,
-                    "to": [agent.name for agent in to_agents],
-                    "cc": [agent.name for agent in cc_agents],
-                    "bcc": [agent.name for agent in bcc_agents],
-                    "attachments": attachments_meta,
                 }
-            )
-            result_snapshot: dict[str, Any] = {
-                "deliveries": [
-                    {
-                        "project": project.human_key,
-                        "payload": payload,
-                    }
-                ],
-                "count": 1,
+
+        # Process attachments (can be slow for images) - do this BEFORE acquiring lock
+        processed_body, attachments_meta, attachment_files = await process_attachments(
+            archive,
+            body_md,
+            attachment_paths or [],
+            convert_markdown,
+            embed_policy=embed_policy,
+        )
+        # Fallback: if body contains inline data URI, reflect that in attachments meta for API parity
+        if not attachments_meta and ("data:image" in body_md):
+            attachments_meta.append({"type": "inline", "media_type": "image/webp"})
+
+        # Create message in DB (doesn't need Git lock)
+        message = await _create_message(
+            project,
+            sender,
+            subject,
+            processed_body,
+            recipient_records,
+            importance,
+            ack_required,
+            thread_id,
+            attachments_meta,
+        )
+
+        # Prepare frontmatter and payload (pure computation, no I/O)
+        frontmatter = _message_frontmatter(
+            message,
+            project,
+            sender,
+            to_agents,
+            cc_agents,
+            bcc_agents,
+            attachments_meta,
+        )
+        recipients_for_archive = [agent.name for agent in to_agents + cc_agents + bcc_agents]
+        payload = _message_to_dict(message)
+        payload.update(
+            {
+                "from": sender.name,
+                "to": [agent.name for agent in to_agents],
+                "cc": [agent.name for agent in cc_agents],
+                "bcc": [agent.name for agent in bcc_agents],
+                "attachments": attachments_meta,
             }
-            panel_end = time.perf_counter()
-            commit_panel_text = _render_commit_panel(
-                tool_name,
-                project.human_key,
-                sender.name,
-                call_start,
-                panel_end,
-                result_snapshot,
-                frontmatter.get("created"),
-            )
-            await write_message_bundle(
-                archive,
-                frontmatter,
-                processed_body,
-                sender.name,
-                recipients_for_archive,
-                attachment_files,
-                commit_panel_text,
-            )
+        )
+        result_snapshot: dict[str, Any] = {
+            "deliveries": [
+                {
+                    "project": project.human_key,
+                    "payload": payload,
+                }
+            ],
+            "count": 1,
+        }
+        panel_end = time.perf_counter()
+        commit_panel_text = _render_commit_panel(
+            tool_name,
+            project.human_key,
+            sender.name,
+            call_start,
+            panel_end,
+            result_snapshot,
+            frontmatter.get("created"),
+        )
+
+        # ============================================================
+        # PHASE 2: Write to Git archive (no lock needed)
+        # File writes can happen in parallel - unique filenames per message
+        # Git commits are serialized by the commit queue (fire-and-forget)
+        # ============================================================
+        await write_message_bundle(
+            archive,
+            frontmatter,
+            processed_body,
+            sender.name,
+            recipients_for_archive,
+            attachment_files,
+            commit_panel_text,
+        )
         await ctx.info(
             f"Message {message.id} created by {sender.name} (to {', '.join(recipients_for_archive)})"
         )
@@ -3204,7 +3263,7 @@ def build_mcp_server() -> FastMCP:
         project = await _ensure_project(human_key)
         await ensure_archive(settings, project.slug)
         # Compose identity metadata similar to resource://identity
-        ident = _resolve_project_identity(human_key)
+        ident = await asyncio.to_thread(_resolve_project_identity, human_key)
         payload = _project_to_dict(project)
         payload.update(ident)
         return payload
@@ -3446,8 +3505,8 @@ def build_mcp_server() -> FastMCP:
                 await session.refresh(db_agent)
                 agent = db_agent
         archive = await ensure_archive(settings, project.slug)
-        async with _archive_write_lock(archive):
-            await write_agent_profile(archive, _agent_to_dict(agent))
+        # No lock needed - unique file per agent, commits serialized by queue
+        await write_agent_profile(archive, _agent_to_dict(agent))
         await ctx.info(f"Created new agent identity '{agent.name}' for project '{project.human_key}'.")
         return _agent_to_dict(agent)
 
@@ -3570,10 +3629,7 @@ def build_mcp_server() -> FastMCP:
         }}}
         ```
         """
-        import logging as _log
-        _log.warning(">>> send_message ENTER project_key=%s sender=%s", project_key, sender_name)
         project = await _get_project_by_identifier(project_key)
-        _log.warning(">>> send_message GOT PROJECT id=%s", project.id)
 
         # Normalize 'to' parameter - accept single string and convert to list
         if isinstance(to, str):
@@ -3682,9 +3738,7 @@ def build_mcp_server() -> FastMCP:
                 c.print(Panel(body, title=title, border_style="green"))
             except Exception:
                 pass
-        _log.warning(">>> send_message BEFORE _get_agent")
         sender = await _get_agent(project, sender_name)
-        _log.warning(">>> send_message GOT SENDER id=%s", sender.id)
         # Enforce contact policies (per-recipient) with auto-allow heuristics
         settings_local = get_settings()
         # Allow ack-required messages to bypass contact enforcement entirely
@@ -3936,7 +3990,6 @@ def build_mcp_server() -> FastMCP:
                         data=err_data,
                     )
         # Split recipients into local vs external (approved links)
-        _log.warning(">>> send_message BEFORE recipient routing")
         local_to: list[str] = []
         local_cc: list[str] = []
         local_bcc: list[str] = []
@@ -5879,65 +5932,60 @@ def build_mcp_server() -> FastMCP:
 
         granted: list[dict[str, Any]] = []
         conflicts: list[dict[str, Any]] = []
-        archive = await ensure_archive(settings, project.slug)
-        async with _archive_write_lock(archive):
-            for path in paths:
-                conflicting_holders: list[dict[str, Any]] = []
-                for file_reservation_record, holder_name in existing_reservations:
-                    if _file_reservations_conflict(file_reservation_record, path, exclusive, agent):
-                        conflicting_holders.append(
-                            {
-                                "agent": holder_name,
-                                "path_pattern": file_reservation_record.path_pattern,
-                                "exclusive": file_reservation_record.exclusive,
-                                "expires_ts": _iso(file_reservation_record.expires_ts),
-                            }
-                        )
-                if conflicting_holders:
-                    # Advisory model: still grant the file_reservation but surface conflicts
-                    conflicts.append({"path": path, "holders": conflicting_holders})
-                file_reservation = await _create_file_reservation(project, agent, path, exclusive, reason, ttl_seconds)
-                # Attempt to capture branch/worktree context (best-effort; non-blocking)
-                ctx_branch: Optional[str] = None
-                ctx_worktree: Optional[str] = None
-                try:
-                    with _git_repo(project.human_key) as repo:
-                        try:
-                            ctx_branch = repo.active_branch.name
-                        except Exception:
-                            try:
-                                ctx_branch = repo.git.rev_parse("--abbrev-ref", "HEAD").strip()
-                            except Exception:
-                                ctx_branch = None
-                        try:
-                            ctx_worktree = Path(repo.working_tree_dir or "").name or None
-                        except Exception:
-                            ctx_worktree = None
-                except Exception:
-                    pass
-                file_reservation_payload = {
+
+        # File reservations are stored in DB only - no Git archive needed
+        # Batch all reservations into a single DB transaction for performance
+        expires = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+        new_reservations: list[FileReservation] = []
+
+        for path in paths:
+            conflicting_holders: list[dict[str, Any]] = []
+            for file_reservation_record, holder_name in existing_reservations:
+                if _file_reservations_conflict(file_reservation_record, path, exclusive, agent):
+                    conflicting_holders.append(
+                        {
+                            "agent": holder_name,
+                            "path_pattern": file_reservation_record.path_pattern,
+                            "exclusive": file_reservation_record.exclusive,
+                            "expires_ts": _iso(file_reservation_record.expires_ts),
+                        }
+                    )
+            if conflicting_holders:
+                # Advisory model: still grant the file_reservation but surface conflicts
+                conflicts.append({"path": path, "holders": conflicting_holders})
+
+            # Create reservation object (will be committed in batch)
+            file_reservation = FileReservation(
+                project_id=project.id,
+                agent_id=agent.id,
+                path_pattern=path,
+                exclusive=exclusive,
+                reason=reason,
+                expires_ts=expires,
+            )
+            new_reservations.append(file_reservation)
+            existing_reservations.append((file_reservation, agent.name))  # type: ignore[attr-defined]
+
+        # Single batch commit for all reservations
+        async with get_session() as session:
+            for res in new_reservations:
+                session.add(res)
+            await session.commit()
+            # Refresh to get IDs
+            for res in new_reservations:
+                await session.refresh(res)
+
+        # Build response
+        for file_reservation in new_reservations:
+            granted.append(
+                {
                     "id": file_reservation.id,
-                    "project": project.human_key,
-                    "agent": agent.name,
                     "path_pattern": file_reservation.path_pattern,
                     "exclusive": file_reservation.exclusive,
                     "reason": file_reservation.reason,
-                    "created_ts": _iso(file_reservation.created_ts),
                     "expires_ts": _iso(file_reservation.expires_ts),
-                    "branch": ctx_branch,
-                    "worktree": ctx_worktree,
                 }
-                await write_file_reservation_record(archive, file_reservation_payload)  # type: ignore[arg-type]
-                granted.append(
-                    {
-                        "id": file_reservation.id,
-                        "path_pattern": file_reservation.path_pattern,
-                        "exclusive": file_reservation.exclusive,
-                        "reason": file_reservation.reason,
-                        "expires_ts": _iso(file_reservation.expires_ts),
-                    }
-                )
-                existing_reservations.append((file_reservation, agent.name))  # type: ignore[attr-defined]
+            )
         await ctx.info(f"Issued {len(granted)} file_reservations for '{agent.name}'. Conflicts: {len(conflicts)}")
         return {"granted": granted, "conflicts": conflicts}
 
@@ -6300,21 +6348,7 @@ def build_mcp_server() -> FastMCP:
                 )
             await session.commit()
 
-        # Update Git artifacts for the renewed file_reservations
-        archive = await ensure_archive(settings, project.slug)
-        async with _archive_write_lock(archive):
-            for file_reservation_info in updated:
-                payload = {
-                    "id": file_reservation_info["id"],
-                    "project": project.human_key,
-                    "agent": agent.name,
-                    "path_pattern": file_reservation_info["path_pattern"],
-                    "exclusive": True,
-                    "reason": "renew",
-                    "created_ts": _iso(now),
-                    "expires_ts": file_reservation_info["new_expires_ts"],
-                }
-                await write_file_reservation_record(archive, payload)
+        # File reservations are stored in DB only - no Git archive needed
         await ctx.info(f"Renewed {len(updated)} file_reservation(s) for '{agent.name}'.")
         return {"renewed": len(updated), "file_reservations": updated}
 
@@ -6380,9 +6414,9 @@ def build_mcp_server() -> FastMCP:
             now = datetime.now(timezone.utc)
             slot_path = _slot_dir(archive, slot)
             await asyncio.to_thread(slot_path.mkdir, parents=True, exist_ok=True)
-            active = _read_active_slots(slot_path, now)
+            active = await asyncio.to_thread(_read_active_slots, slot_path, now)
 
-            branch = _compute_branch(project.human_key)
+            branch = await asyncio.to_thread(_compute_branch, project.human_key)
             holder_id = _safe_component(f"{agent_name}__{branch or 'unknown'}")
             lease_path = slot_path / f"{holder_id}.json"
 
@@ -6869,7 +6903,7 @@ def build_mcp_server() -> FastMCP:
             raise ToolExecutionError("FEATURE_DISABLED", "Product Bus is disabled. Enable WORKTREES_ENABLED to use this tool.")
     if settings.worktrees_enabled:
         @mcp.resource("resource://identity/{project}", mime_type="application/json")
-        def identity_resource(project: str) -> dict[str, Any]:
+        async def identity_resource(project: str) -> dict[str, Any]:
             """
             Inspect identity resolution for a given project path. Returns the slug actually used,
             the identity mode in effect, canonical path for the selected mode, and git repo facts.
@@ -6877,7 +6911,7 @@ def build_mcp_server() -> FastMCP:
             raw_path, _ = _split_slug_and_query(project)
             target_path = str(Path(raw_path).expanduser().resolve())
 
-            return _resolve_project_identity(target_path)
+            return await asyncio.to_thread(_resolve_project_identity, target_path)
     @mcp.resource("resource://tooling/directory", mime_type="application/json")
     def tooling_directory_resource() -> dict[str, Any]:
         """

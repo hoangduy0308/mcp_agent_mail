@@ -571,6 +571,30 @@ async def _get_product_record(key: str) -> Product:
         return prod
 
 
+def _suppress_windows_connection_reset_errors() -> None:
+    """Suppress harmless Windows connection reset errors in asyncio logs.
+
+    On Windows, when MCP clients disconnect abruptly, Python's ProactorEventLoop
+    logs ConnectionResetError in _call_connection_lost(). These are harmless
+    but spam the logs.
+    """
+    if sys.platform != "win32":
+        return
+
+    import logging
+
+    class _ConnectionResetFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            msg = record.getMessage()
+            if "ConnectionResetError" in msg and "10054" in msg:
+                return False
+            return "_call_connection_lost" not in msg
+
+    # Apply filter to asyncio logger
+    asyncio_logger = logging.getLogger("asyncio")
+    asyncio_logger.addFilter(_ConnectionResetFilter())
+
+
 @app.command("serve-http")
 def serve_http(
     host: Optional[str] = typer.Option(None, help="Host interface for HTTP transport. Defaults to HTTP_HOST setting."),
@@ -578,6 +602,9 @@ def serve_http(
     path: Optional[str] = typer.Option(None, help="HTTP path where the MCP endpoint is exposed."),
 ) -> None:
     """Run the MCP server over the Streamable HTTP transport."""
+    # Suppress Windows connection reset noise in logs
+    _suppress_windows_connection_reset_errors()
+
     settings = get_settings()
     resolved_host = host or settings.http.host
     resolved_port = port or settings.http.port

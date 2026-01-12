@@ -6,12 +6,15 @@ import asyncio
 import base64
 import contextlib
 import ctypes
+import functools
 import hashlib
 import json
 import logging
+import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -580,8 +583,9 @@ class _GitCommitQueue:
         author_name: str,
         author_email: str,
         wait_timeout: float = 120.0,
+        fire_and_forget: bool = False,
     ) -> None:
-        """Enqueue a commit request and wait for it to complete.
+        """Enqueue a commit request and optionally wait for it to complete.
 
         Args:
             repo_path: Working tree path of the Git repo
@@ -590,11 +594,12 @@ class _GitCommitQueue:
             author_name: Git author name
             author_email: Git author email
             wait_timeout: Max time to wait for commit to complete (default 120s)
+            fire_and_forget: If True, don't wait for commit to complete (default False)
 
         Raises:
-            GitOperationTimeout: If the commit times out
+            GitOperationTimeout: If the commit times out (only when fire_and_forget=False)
             RuntimeError: If the queue is not started
-            Exception: Any error from the actual Git commit
+            Exception: Any error from the actual Git commit (only when fire_and_forget=False)
         """
         if not self._started:
             await self.start()
@@ -618,6 +623,10 @@ class _GitCommitQueue:
             raise GitOperationTimeout(
                 "Commit queue is full - too many pending commits. Try again later."
             ) from None
+
+        # If fire_and_forget, return immediately without waiting
+        if fire_and_forget:
+            return
 
         # Wait for the worker to process our request
         try:
@@ -659,34 +668,41 @@ class _GitCommitQueue:
             return
 
         def _do_commit() -> None:
-            repo = Repo(request.repo_path)
-            actor = Actor(request.author_name, request.author_email)
+            repo = None
+            try:
+                repo = Repo(request.repo_path)
+                actor = Actor(request.author_name, request.author_email)
 
-            repo.index.add(request.rel_paths)
-            if repo.is_dirty(index=True, working_tree=True):
-                # Build trailers
-                trailers: list[str] = []
-                message = request.message
-                try:
-                    lower_msg = message.lower()
-                    have_agent_line = "\nagent:" in lower_msg
-                    if message.startswith("mail: ") and not have_agent_line:
-                        head = message[len("mail: "):]
-                        agent_part = head.split("->", 1)[0].strip()
-                        if agent_part:
-                            trailers.append(f"Agent: {agent_part}")
-                    elif message.startswith("file_reservation: ") and not have_agent_line:
-                        head = message[len("file_reservation: "):]
-                        agent_part = head.split(" ", 1)[0].strip()
-                        if agent_part:
-                            trailers.append(f"Agent: {agent_part}")
-                except Exception:
-                    pass
+                repo.index.add(request.rel_paths)
+                if repo.is_dirty(index=True, working_tree=True):
+                    # Build trailers
+                    trailers: list[str] = []
+                    message = request.message
+                    try:
+                        lower_msg = message.lower()
+                        have_agent_line = "\nagent:" in lower_msg
+                        if message.startswith("mail: ") and not have_agent_line:
+                            head = message[len("mail: "):]
+                            agent_part = head.split("->", 1)[0].strip()
+                            if agent_part:
+                                trailers.append(f"Agent: {agent_part}")
+                        elif message.startswith("file_reservation: ") and not have_agent_line:
+                            head = message[len("file_reservation: "):]
+                            agent_part = head.split(" ", 1)[0].strip()
+                            if agent_part:
+                                trailers.append(f"Agent: {agent_part}")
+                    except Exception:
+                        pass
 
-                final_message = message
-                if trailers:
-                    final_message = message + "\n\n" + "\n".join(trailers) + "\n"
-                repo.index.commit(final_message, author=actor, committer=actor)
+                    final_message = message
+                    if trailers:
+                        final_message = message + "\n\n" + "\n".join(trailers) + "\n"
+                    repo.index.commit(final_message, author=actor, committer=actor)
+            finally:
+                # Always close the repo to avoid leaking file handles
+                if repo is not None:
+                    with contextlib.suppress(Exception):
+                        repo.close()
 
         # Run the actual commit in a thread with timeout
         await _to_thread(_do_commit, _timeout=60.0)
@@ -695,6 +711,20 @@ class _GitCommitQueue:
 # Global commit queue instance
 _COMMIT_QUEUE: _GitCommitQueue | None = None
 _COMMIT_QUEUE_LOCK: asyncio.Lock | None = None
+
+# Per-thread digest locks to prevent race conditions when appending to same thread
+_THREAD_DIGEST_LOCKS: dict[str, asyncio.Lock] = {}
+_THREAD_DIGEST_LOCKS_LOCK: asyncio.Lock | None = None
+
+
+def _get_thread_digest_lock(thread_id: str) -> asyncio.Lock:
+    """Get or create a lock for a specific thread digest file."""
+    global _THREAD_DIGEST_LOCKS_LOCK
+    if _THREAD_DIGEST_LOCKS_LOCK is None:
+        _THREAD_DIGEST_LOCKS_LOCK = asyncio.Lock()
+    if thread_id not in _THREAD_DIGEST_LOCKS:
+        _THREAD_DIGEST_LOCKS[thread_id] = asyncio.Lock()
+    return _THREAD_DIGEST_LOCKS[thread_id]
 
 
 def _get_commit_queue_lock() -> asyncio.Lock:
@@ -838,8 +868,9 @@ class AsyncFileLock:
 
             logging.debug(f"AsyncFileLock: acquiring cross-process lock {self._mutex_name}")
 
-            # Run blocking acquire in thread pool
-            acquired = await _to_thread(self._cross_process_lock.acquire)
+            # Run blocking acquire in thread pool with matching timeout
+            # Add buffer to _to_thread timeout so mutex timeout triggers first with proper error
+            acquired = await _to_thread(self._cross_process_lock.acquire, _timeout=self._timeout + 10.0)
 
             if not acquired:
                 raise TimeoutError(
@@ -918,8 +949,11 @@ class AsyncFileLock:
 
 
 @asynccontextmanager
-async def archive_write_lock(archive: ProjectArchive, *, timeout_seconds: float = 60.0) -> AsyncIterator[None]:
-    """Context manager for safely mutating archive surfaces."""
+async def archive_write_lock(archive: ProjectArchive, *, timeout_seconds: float = 180.0) -> AsyncIterator[None]:
+    """Context manager for safely mutating archive surfaces.
+
+    Note: timeout must be >= commit queue timeout (120s) since lock is held during commits.
+    """
 
     lock = AsyncFileLock(archive.lock_path, timeout_seconds=timeout_seconds)
     await lock.__aenter__()
@@ -937,6 +971,35 @@ T = TypeVar('T')
 # Default timeout for thread operations (especially Git ops that can hang on lock contention)
 _DEFAULT_THREAD_TIMEOUT: float = 60.0
 
+# Dedicated thread pool for Git/IO operations to prevent exhaustion of the default asyncio pool
+# With 4 agents, each potentially making multiple concurrent Git calls, we need enough workers
+# to avoid blocking the event loop
+_GIT_THREAD_POOL: ThreadPoolExecutor | None = None
+_GIT_THREAD_POOL_SIZE = min(32, (os.cpu_count() or 4) * 4)  # Default: 4x CPU count, max 32
+
+
+def _get_git_thread_pool() -> ThreadPoolExecutor:
+    """Get or create the dedicated Git/IO thread pool.
+
+    Using a separate pool from asyncio's default prevents Git operations
+    from starving other async operations when many agents run in parallel.
+    """
+    global _GIT_THREAD_POOL
+    if _GIT_THREAD_POOL is None:
+        _GIT_THREAD_POOL = ThreadPoolExecutor(
+            max_workers=_GIT_THREAD_POOL_SIZE,
+            thread_name_prefix="git-io-"
+        )
+    return _GIT_THREAD_POOL
+
+
+def shutdown_git_thread_pool() -> None:
+    """Shutdown the Git thread pool gracefully. Call on server shutdown."""
+    global _GIT_THREAD_POOL
+    if _GIT_THREAD_POOL is not None:
+        _GIT_THREAD_POOL.shutdown(wait=True, cancel_futures=False)
+        _GIT_THREAD_POOL = None
+
 
 class GitOperationTimeout(Exception):
     """Raised when a Git operation times out waiting for locks."""
@@ -952,6 +1015,10 @@ async def _to_thread(
 ) -> Any:
     """Run a blocking function in a thread with optional timeout.
 
+    Uses a dedicated thread pool for Git/IO operations to prevent
+    exhaustion of the default asyncio executor when many agents
+    run in parallel.
+
     Args:
         func: The blocking function to run
         *args: Positional arguments for func
@@ -963,14 +1030,20 @@ async def _to_thread(
         GitOperationTimeout: If the operation times out
     """
     timeout = _timeout if _timeout is not None else _DEFAULT_THREAD_TIMEOUT
+    loop = asyncio.get_running_loop()
+    pool = _get_git_thread_pool()
+
+    # Use run_in_executor with our dedicated pool instead of asyncio.to_thread
+    # which uses the default executor that can get exhausted
+    partial_func = functools.partial(func, *args, **kwargs)
 
     if timeout <= 0:
-        # No timeout - original behavior
-        return await asyncio.to_thread(func, *args, **kwargs)
+        # No timeout
+        return await loop.run_in_executor(pool, partial_func)
 
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(func, *args, **kwargs),
+            loop.run_in_executor(pool, partial_func),
             timeout=timeout,
         )
     except asyncio.TimeoutError:
@@ -1112,12 +1185,12 @@ async def _ensure_repo(root: Path, settings: Settings) -> Repo:
 
         git_dir = root / ".git"
         if git_dir.exists():
-            repo = Repo(str(root))
+            repo = await _to_thread(Repo, str(root))
             _REPO_CACHE.put(cache_key, repo)
             return repo
 
         repo_result = await _to_thread(Repo.init, str(root))
-        repo = Repo(repo_result.working_dir) if hasattr(repo_result, 'working_dir') else repo_result
+        repo = await _to_thread(Repo, repo_result.working_dir) if hasattr(repo_result, 'working_dir') else repo_result
         # Ensure deterministic, non-interactive commits (disable GPG signing)
         try:
             def _configure_repo() -> None:
@@ -1135,6 +1208,10 @@ async def _ensure_repo(root: Path, settings: Settings) -> Repo:
 
 
 async def write_agent_profile(archive: ProjectArchive, agent: dict[str, object]) -> None:
+    # Skip Git archive writes if disabled (DB-only mode for performance)
+    if not archive.settings.storage.git_enabled:
+        return
+
     profile_path = archive.root / "agents" / agent["name"].__str__() / "profile.json"
     await _write_json(profile_path, agent)
     rel = profile_path.relative_to(archive.repo_root).as_posix()
@@ -1142,6 +1219,10 @@ async def write_agent_profile(archive: ProjectArchive, agent: dict[str, object])
 
 
 async def write_file_reservation_record(archive: ProjectArchive, file_reservation: dict[str, object]) -> None:
+    # Skip Git archive writes if disabled (DB-only mode for performance)
+    if not archive.settings.storage.git_enabled:
+        return
+
     path_pattern = str(file_reservation.get("path_pattern") or file_reservation.get("path") or "").strip()
     if not path_pattern:
         raise ValueError("File reservation record must include 'path_pattern'.")
@@ -1169,6 +1250,10 @@ async def write_message_bundle(
     extra_paths: Sequence[str] | None = None,
     commit_text: str | None = None,
 ) -> None:
+    # Skip Git archive writes if disabled (DB-only mode for performance)
+    if not archive.settings.storage.git_enabled:
+        return
+
     timestamp_obj: Any = message.get("created") or message.get("created_ts")
     timestamp_str = timestamp_obj if isinstance(timestamp_obj, str) else datetime.now(timezone.utc).isoformat()
     now = datetime.fromisoformat(timestamp_str)
@@ -1263,43 +1348,49 @@ async def _update_thread_digest(
 
     The digest lives at messages/threads/{thread_id}.md and contains an
     append-only sequence of sections linking to canonical messages.
+
+    Uses per-thread lock to prevent race conditions when multiple messages
+    to the same thread are sent simultaneously.
     """
-    digest_dir = archive.root / "messages" / "threads"
-    await _to_thread(digest_dir.mkdir, parents=True, exist_ok=True)
-    digest_path = digest_dir / f"{thread_id}.md"
+    # Acquire per-thread lock to serialize appends to same digest file
+    thread_lock = _get_thread_digest_lock(thread_id)
+    async with thread_lock:
+        digest_dir = archive.root / "messages" / "threads"
+        await _to_thread(digest_dir.mkdir, parents=True, exist_ok=True)
+        digest_path = digest_dir / f"{thread_id}.md"
 
-    # Ensure recipients list is typed as list[str] for join()
-    to_value = meta.get("to")
-    if isinstance(to_value, (list, tuple)):
-        recipients_list: list[str] = [str(v) for v in to_value]
-    elif isinstance(to_value, str):
-        recipients_list = [to_value]
-    else:
-        recipients_list = []
-    header = (
-        f"## {meta.get('created', '')} — {meta.get('from', '')} → {', '.join(recipients_list)}\n\n"
-    )
-    link_line = f"[View canonical]({canonical_rel_path})\n\n"
-    subject = str(meta.get("subject", "")).strip()
-    subject_line = f"### {subject}\n\n" if subject else ""
+        # Ensure recipients list is typed as list[str] for join()
+        to_value = meta.get("to")
+        if isinstance(to_value, (list, tuple)):
+            recipients_list: list[str] = [str(v) for v in to_value]
+        elif isinstance(to_value, str):
+            recipients_list = [to_value]
+        else:
+            recipients_list = []
+        header = (
+            f"## {meta.get('created', '')} — {meta.get('from', '')} → {', '.join(recipients_list)}\n\n"
+        )
+        link_line = f"[View canonical]({canonical_rel_path})\n\n"
+        subject = str(meta.get("subject", "")).strip()
+        subject_line = f"### {subject}\n\n" if subject else ""
 
-    # Truncate body to a preview to keep digest readable
-    preview = body_md.strip()
-    if len(preview) > 1200:
-        preview = preview[:1200].rstrip() + "\n..."
+        # Truncate body to a preview to keep digest readable
+        preview = body_md.strip()
+        if len(preview) > 1200:
+            preview = preview[:1200].rstrip() + "\n..."
 
-    entry = subject_line + header + link_line + preview + "\n\n---\n\n"
+        entry = subject_line + header + link_line + preview + "\n\n---\n\n"
 
-    # Append atomically
-    def _append() -> None:
-        mode = "a" if digest_path.exists() else "w"
-        with digest_path.open(mode, encoding="utf-8") as f:
-            if mode == "w":
-                f.write(f"# Thread {thread_id}\n\n")
-            f.write(entry)
+        # Append atomically
+        def _append() -> None:
+            mode = "a" if digest_path.exists() else "w"
+            with digest_path.open(mode, encoding="utf-8") as f:
+                if mode == "w":
+                    f.write(f"# Thread {thread_id}\n\n")
+                f.write(entry)
 
-    await _to_thread(_append)
-    return digest_path.relative_to(archive.repo_root).as_posix()
+        await _to_thread(_append)
+        return digest_path.relative_to(archive.repo_root).as_posix()
 
 
 async def process_attachments(
@@ -1543,6 +1634,8 @@ async def _commit(repo: Repo, settings: Settings, message: str, rel_paths: Seque
     """Commit changes to the Git repository via the global commit queue.
 
     This ensures all commits are serialized to prevent Git lock contention.
+    Uses fire_and_forget=True to avoid blocking callers while Git commits
+    are processed in background.
     """
     if not rel_paths:
         return
@@ -1552,6 +1645,8 @@ async def _commit(repo: Repo, settings: Settings, message: str, rel_paths: Seque
         raise ValueError("Repository has no working tree directory")
 
     # Use the global commit queue to serialize all Git commits
+    # fire_and_forget=True means we don't wait for the commit to complete
+    # This prevents lock contention when multiple agents send messages
     queue = await get_commit_queue()
     await queue.enqueue(
         repo_path=str(working_tree),
@@ -1559,6 +1654,7 @@ async def _commit(repo: Repo, settings: Settings, message: str, rel_paths: Seque
         rel_paths=list(rel_paths),
         author_name=settings.storage.git_author_name,
         author_email=settings.storage.git_author_email,
+        fire_and_forget=True,
     )
 
 

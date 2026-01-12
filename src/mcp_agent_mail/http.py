@@ -46,7 +46,6 @@ from .storage import (
     get_recent_commits,
     get_timeline_commits,
     write_agent_profile,
-    write_file_reservation_record,
 )
 
 
@@ -687,25 +686,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:  # type: ignore[
                                                 },
                                             )
                                             await s2.commit()
-                                        # Also write JSON artifact to archive
-                                        project_slug = (await _project_slug_from_id(project_id)) or ""
-                                        archive = await ensure_archive(settings, project_slug)
-                                        expires_at = now + _dt.timedelta(
-                                            seconds=settings.ack_escalation_claim_ttl_seconds
-                                        )
-                                        async with archive_write_lock(archive):
-                                            await write_file_reservation_record(
-                                                archive,
-                                                {
-                                                    "project": project_slug,
-                                                    "agent": settings.ack_escalation_claim_holder_name or "ops",
-                                                    "path_pattern": pattern,
-                                                    "exclusive": settings.ack_escalation_claim_exclusive,
-                                                    "reason": "ack-overdue",
-                                                    "created_ts": now.astimezone().isoformat(),
-                                                    "expires_ts": expires_at.astimezone().isoformat(),
-                                                },
-                                            )
+                                        # File reservations stored in DB only - no Git archive needed
                                     except Exception:
                                         pass
                 except Exception:

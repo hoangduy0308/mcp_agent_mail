@@ -22,6 +22,27 @@ _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 _schema_ready = False
 _schema_lock: asyncio.Lock | None = None
+_write_lock: asyncio.Lock | None = None  # Global write lock for SQLite serialization
+
+
+def _get_write_lock() -> asyncio.Lock:
+    """Get or create the global write lock for SQLite write serialization."""
+    global _write_lock
+    if _write_lock is None:
+        _write_lock = asyncio.Lock()
+    return _write_lock
+
+
+@asynccontextmanager
+async def get_write_lock() -> AsyncIterator[None]:
+    """Acquire the global write lock for SQLite write operations.
+    
+    Use this to serialize write-heavy operations like send_message
+    to prevent SQLite lock contention.
+    """
+    lock = _get_write_lock()
+    async with lock:
+        yield
 
 
 def retry_on_db_lock(max_retries: int = 5, base_delay: float = 0.1, max_delay: float = 5.0) -> Callable[..., Any]:

@@ -80,6 +80,7 @@ class StorageSettings:
     inline_image_max_bytes: int
     convert_images: bool
     keep_original_images: bool
+    git_enabled: bool  # If False, skip Git archive writes entirely (DB-only mode)
 
 
 @dataclass(slots=True, frozen=True)
@@ -249,6 +250,7 @@ def get_settings() -> Settings:
         inline_image_max_bytes=_int(_decouple_config("INLINE_IMAGE_MAX_BYTES", default=str(64 * 1024)), default=64 * 1024),
         convert_images=_bool(_decouple_config("CONVERT_IMAGES", default="true"), default=True),
         keep_original_images=_bool(_decouple_config("KEEP_ORIGINAL_IMAGES", default="false"), default=False),
+        git_enabled=_bool(_decouple_config("GIT_ENABLED", default="true"), default=True),
     )
 
     cors_settings = CorsSettings(
