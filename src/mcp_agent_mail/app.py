@@ -3351,7 +3351,16 @@ def build_mcp_server() -> FastMCP:
         - Use the same `project_key` consistently across cooperating agents.
         """
         _validate_program_model(program, model)
-        project = await _get_project_by_identifier(project_key)
+        # Auto-create project if it doesn't exist and project_key is an absolute path
+        try:
+            project = await _get_project_by_identifier(project_key)
+        except ToolExecutionError as exc:
+            if exc.error_type == "NOT_FOUND" and Path(project_key).is_absolute():
+                project = await _ensure_project(project_key)
+                # Also ensure archive is initialized for new project
+                await ensure_archive(settings, project.slug)
+            else:
+                raise
         if settings.tools_log_enabled:
             try:
                 import importlib as _imp
@@ -3494,7 +3503,15 @@ def build_mcp_server() -> FastMCP:
         ```
         """
         _validate_program_model(program, model)
-        project = await _get_project_by_identifier(project_key)
+        # Auto-create project if it doesn't exist and project_key is an absolute path
+        try:
+            project = await _get_project_by_identifier(project_key)
+        except ToolExecutionError as exc:
+            if exc.error_type == "NOT_FOUND" and Path(project_key).is_absolute():
+                project = await _ensure_project(project_key)
+                # Archive will be ensured below anyway
+            else:
+                raise
         unique_name = await _generate_unique_agent_name(project, settings, name_hint)
         ap = (attachments_policy or "auto").lower()
         if ap not in {"auto", "inline", "file"}:
