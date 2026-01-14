@@ -10,6 +10,7 @@ import importlib
 import json
 import logging
 import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -115,8 +116,27 @@ def _configure_logging(settings: Settings) -> None:
     # Suppress SSE ping keepalive debug logs (periodic noise every 15s)
     logging.getLogger("sse_starlette.sse").setLevel(logging.INFO)
 
+    # Suppress MCP notification validation warnings (notifications/initialized has no params schema)
+    logging.getLogger("mcp.server.lowlevel").setLevel(logging.ERROR)
+    logging.getLogger("root").setLevel(logging.INFO)
+
     # mark configured
     _LOGGING_CONFIGURED = True
+
+
+def _windows_asyncio_exception_handler(loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+    """Custom exception handler to suppress Windows-specific IOCP errors.
+
+    WinError 64 (network name no longer available) occurs when clients disconnect
+    abruptly before accept() completes. This is harmless but asyncio logs it as ERROR.
+    """
+    exception = context.get("exception")
+    # WinError 64: The specified network name is no longer available
+    # WinError 995: The I/O operation has been aborted (client disconnect)
+    if isinstance(exception, OSError) and getattr(exception, "winerror", None) in {64, 995}:
+        return  # Suppress - this is expected when clients disconnect abruptly
+    # Fall back to default handler for all other exceptions
+    loop.default_exception_handler(context)
 
 
 class BearerAuthMiddleware:
@@ -472,6 +492,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:  # type: ignore[
 
     # Background workers lifecycle
     async def _startup() -> None:  # pragma: no cover - service lifecycle
+        # Install Windows-specific exception handler to suppress IOCP client disconnect errors
+        if sys.platform == "win32":
+            loop = asyncio.get_running_loop()
+            loop.set_exception_handler(_windows_asyncio_exception_handler)
+
         if not (
             settings.file_reservations_cleanup_enabled
             or settings.ack_ttl_enabled
