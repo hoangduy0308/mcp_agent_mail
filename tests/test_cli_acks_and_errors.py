@@ -10,6 +10,11 @@ from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.models import Agent, Message, MessageRecipient, Project
 
 
+def _require_id(value: int | None) -> int:
+    assert value is not None
+    return value
+
+
 def _seed_ack_data() -> None:
     async def _seed() -> None:
         await ensure_schema()
@@ -18,20 +23,19 @@ def _seed_ack_data() -> None:
             s.add(p)
             await s.commit()
             await s.refresh(p)
-            assert p.id is not None
-            a = Agent(project_id=p.id, name="Blue", program="x", model="y", task_description="")
+            project_id = _require_id(p.id)
+            a = Agent(project_id=project_id, name="Blue", program="x", model="y", task_description="")
             s.add(a)
             await s.commit()
             await s.refresh(a)
-            assert a.id is not None
+            agent_id = _require_id(a.id)
             # create backdated ack-required messages
             old = datetime.now(timezone.utc) - timedelta(minutes=90)
-            m1 = Message(project_id=p.id, sender_id=a.id, subject="Pending", body_md="x", ack_required=True, created_ts=old)
+            m1 = Message(project_id=project_id, sender_id=agent_id, subject="Pending", body_md="x", ack_required=True, created_ts=old)
             s.add(m1)
             await s.commit()
             await s.refresh(m1)
-            assert m1.id is not None
-            s.add(MessageRecipient(message_id=m1.id, agent_id=a.id, kind="to", read_ts=None, ack_ts=None))
+            s.add(MessageRecipient(message_id=_require_id(m1.id), agent_id=agent_id, kind="to", read_ts=None, ack_ts=None))
             await s.commit()
     asyncio.run(_seed())
 

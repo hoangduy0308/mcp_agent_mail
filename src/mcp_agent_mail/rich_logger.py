@@ -661,7 +661,7 @@ def create_data_tree(data: dict[str, Any], root_label: str = "Data") -> Tree:
     """Create a rich tree view for nested data structures."""
     tree = Tree(f"[bold bright_white]{root_label}[/bold bright_white]")
 
-    def add_items(parent: Tree, items: dict[str, Any] | list[Any]) -> None:
+    def add_items(parent: Tree, items: object) -> None:
         """Recursively add items to the tree."""
         if isinstance(items, dict):
             for key, value in items.items():

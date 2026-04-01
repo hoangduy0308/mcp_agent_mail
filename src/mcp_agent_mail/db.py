@@ -18,6 +18,7 @@ Key invariants:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import logging
 import random
@@ -687,8 +688,10 @@ def reset_database_state() -> None:
                     loop.run_until_complete(engine.dispose())
                 else:
                     asyncio.run(engine.dispose())
-        except Exception:
             # Last resort: sync pool disposal.
+            with suppress(Exception):
+                engine.sync_engine.dispose()
+        except Exception:
             with suppress(Exception):
                 engine.sync_engine.dispose()
     _engine = None
@@ -802,6 +805,9 @@ def _setup_fts(connection: Any) -> None:
     ]:
         with suppress(Exception):  # Column already exists — safe to ignore
             connection.exec_driver_sql(migration_sql)
+        with contextlib.suppress(Exception):
+            connection.exec_driver_sql(migration_sql)
+            # Column already exists — safe to ignore
 
     # Index migrations for newly added columns.
     # CREATE INDEX IF NOT EXISTS is natively idempotent in SQLite.

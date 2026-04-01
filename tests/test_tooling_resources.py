@@ -109,7 +109,7 @@ async def test_tooling_locks_resource(isolated_env):
     metadata_path.write_text(json.dumps({"pid": os.getpid(), "created_ts": time.time()}), encoding="utf-8")
 
     async with Client(server) as client:
-        blocks = await client.read_resource("resource://tooling/locks")
+        blocks = await client.read_resource("resource://tooling/locks?format=json")
         assert blocks
         payload = json.loads(blocks[0].text or "{}")
         assert payload.get("summary", {}).get("total") == 1

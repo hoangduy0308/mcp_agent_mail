@@ -29,6 +29,11 @@ runner = CliRunner()
 # ============================================================================
 
 
+def _require_id(value: int | None) -> int:
+    assert value is not None
+    return value
+
+
 async def seed_project_with_agents() -> tuple[Project, Agent, Agent]:
     """Create a project with two agents for message exchange."""
     await ensure_schema()
@@ -37,17 +42,17 @@ async def seed_project_with_agents() -> tuple[Project, Agent, Agent]:
         session.add(project)
         await session.commit()
         await session.refresh(project)
-        assert project.id is not None
+        project_id = _require_id(project.id)
 
         sender = Agent(
-            project_id=project.id,
+            project_id=project_id,
             name="Sender",
             program="test",
             model="test",
             task_description="Sending messages",
         )
         receiver = Agent(
-            project_id=project.id,
+            project_id=project_id,
             name="Receiver",
             program="test",
             model="test",
@@ -81,10 +86,12 @@ async def seed_message_with_ack(
         created_ts = datetime.now(timezone.utc) - timedelta(minutes=created_offset_minutes)
         # Convert to naive for SQLite
         created_ts_naive = created_ts.replace(tzinfo=None)
+        project_id = _require_id(project.id)
+        sender_id = _require_id(sender.id)
 
         message = Message(
-            project_id=project.id,
-            sender_id=sender.id,
+            project_id=project_id,
+            sender_id=sender_id,
             subject=subject,
             body_md="Test message body",
             ack_required=ack_required,
@@ -97,8 +104,8 @@ async def seed_message_with_ack(
         assert message.id is not None
 
         recipient = MessageRecipient(
-            message_id=message.id,
-            agent_id=receiver.id,
+            message_id=_require_id(message.id),
+            agent_id=_require_id(receiver.id),
             kind="to",
             ack_ts=datetime.now(timezone.utc).replace(tzinfo=None) if acknowledged else None,
         )
@@ -546,8 +553,8 @@ def test_acks_pending_shows_message_details(isolated_env):
         assert receiver.id is not None
         async with get_session() as session:
             message = Message(
-                project_id=project.id,
-                sender_id=sender.id,
+                project_id=_require_id(project.id),
+                sender_id=_require_id(sender.id),
                 subject="Threaded Message",
                 body_md="Body",
                 ack_required=True,
@@ -559,7 +566,7 @@ def test_acks_pending_shows_message_details(isolated_env):
             await session.refresh(message)
             assert message.id is not None
             session.add(
-                MessageRecipient(message_id=message.id, agent_id=receiver.id, kind="cc")
+                MessageRecipient(message_id=_require_id(message.id), agent_id=_require_id(receiver.id), kind="cc")
             )
             await session.commit()
 
@@ -584,8 +591,8 @@ def test_acks_remind_read_status_indicator(isolated_env):
         assert receiver.id is not None
         async with get_session() as session:
             message = Message(
-                project_id=project.id,
-                sender_id=sender.id,
+                project_id=_require_id(project.id),
+                sender_id=_require_id(sender.id),
                 subject="Read But Not Acked",
                 body_md="Body",
                 ack_required=True,
@@ -599,8 +606,8 @@ def test_acks_remind_read_status_indicator(isolated_env):
             assert message.id is not None
             session.add(
                 MessageRecipient(
-                    message_id=message.id,
-                    agent_id=receiver.id,
+                    message_id=_require_id(message.id),
+                    agent_id=_require_id(receiver.id),
                     kind="to",
                     read_ts=datetime.now(timezone.utc).replace(tzinfo=None),
                 )
@@ -629,7 +636,7 @@ def test_multiple_recipients_handled(isolated_env):
         async with get_session() as session:
             # Create another agent
             other = Agent(
-                project_id=project.id,
+                project_id=_require_id(project.id),
                 name="Other",
                 program="test",
                 model="test",
@@ -641,8 +648,8 @@ def test_multiple_recipients_handled(isolated_env):
             assert other.id is not None
 
             message = Message(
-                project_id=project.id,
-                sender_id=sender.id,
+                project_id=_require_id(project.id),
+                sender_id=_require_id(sender.id),
                 subject="Multi Recipient",
                 body_md="Body",
                 ack_required=True,
@@ -655,10 +662,10 @@ def test_multiple_recipients_handled(isolated_env):
 
             # Add multiple recipients
             session.add(
-                MessageRecipient(message_id=message.id, agent_id=receiver.id, kind="to")
+                MessageRecipient(message_id=_require_id(message.id), agent_id=_require_id(receiver.id), kind="to")
             )
             session.add(
-                MessageRecipient(message_id=message.id, agent_id=other.id, kind="cc")
+                MessageRecipient(message_id=_require_id(message.id), agent_id=_require_id(other.id), kind="cc")
             )
             await session.commit()
 

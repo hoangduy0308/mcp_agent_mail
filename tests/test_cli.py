@@ -8,6 +8,11 @@ from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.models import Agent, Project
 
 
+def _require_id(value: int | None) -> int:
+    assert value is not None
+    return value
+
+
 def test_cli_lint(monkeypatch):
     runner = CliRunner()
     captured: list[list[str]] = []
@@ -92,10 +97,10 @@ def test_cli_list_projects(isolated_env):
             session.add(project)
             await session.commit()
             await session.refresh(project)
-            assert project.id is not None
+            project_id = _require_id(project.id)
             session.add(
                 Agent(
-                    project_id=project.id,
+                    project_id=project_id,
                     name="BlueLake",
                     program="codex",
                     model="gpt-5",

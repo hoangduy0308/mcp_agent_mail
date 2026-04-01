@@ -2,6 +2,7 @@ import asyncio
 import os
 import shutil
 import sqlite3
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -10,9 +11,14 @@ from typer.testing import CliRunner
 
 from mcp_agent_mail import cli as cli_module
 from mcp_agent_mail.cli import app
-from mcp_agent_mail.db import ensure_schema, get_session
+from mcp_agent_mail.db import ensure_schema, get_session, reset_database_state
 from mcp_agent_mail.models import Agent, Message, MessageRecipient, Project
 from mcp_agent_mail.share import resolve_sqlite_database_path
+
+
+def _require_id(value: int | None) -> int:
+    assert value is not None
+    return value
 
 
 @pytest.mark.filterwarnings("ignore:.*ResourceWarning")
@@ -29,17 +35,17 @@ def test_archive_save_list_restore_cycle(isolated_env):
             session.add(project)
             await session.commit()
             await session.refresh(project)
-            assert project.id is not None
+            project_id = _require_id(project.id)
 
-            agent = Agent(project_id=project.id, name="BlueLake", program="codex", model="gpt5")
+            agent = Agent(project_id=project_id, name="BlueLake", program="codex", model="gpt5")
             session.add(agent)
             await session.commit()
             await session.refresh(agent)
-            assert agent.id is not None
+            agent_id = _require_id(agent.id)
 
             message = Message(
-                project_id=project.id,
-                sender_id=agent.id,
+                project_id=project_id,
+                sender_id=agent_id,
                 subject="Disaster drill",
                 body_md="Ack me",
                 ack_required=True,
@@ -48,11 +54,11 @@ def test_archive_save_list_restore_cycle(isolated_env):
             session.add(message)
             await session.commit()
             await session.refresh(message)
-            assert message.id is not None
+            message_id = _require_id(message.id)
 
             recipient = MessageRecipient(
-                message_id=message.id,
-                agent_id=agent.id,
+                message_id=message_id,
+                agent_id=agent_id,
                 kind="to",
                 read_ts=datetime(2025, 1, 1, tzinfo=timezone.utc),
                 ack_ts=datetime(2025, 1, 2, tzinfo=timezone.utc),
@@ -78,17 +84,22 @@ def test_archive_save_list_restore_cycle(isolated_env):
         assert list_result.exit_code == 0
         assert archive_path.name in list_result.stdout
 
+        reset_database_state()
         database_path = resolve_sqlite_database_path()
         if database_path.exists():
-            database_path.unlink()
+            with suppress(PermissionError):
+                database_path.unlink()
         wal_path = Path(f"{database_path}-wal")
         if wal_path.exists():
-            wal_path.unlink()
+            with suppress(PermissionError):
+                wal_path.unlink()
         shm_path = Path(f"{database_path}-shm")
         if shm_path.exists():
-            shm_path.unlink()
+            with suppress(PermissionError):
+                shm_path.unlink()
         if storage_root.exists():
-            shutil.rmtree(storage_root)
+            with suppress(PermissionError):
+                shutil.rmtree(storage_root)
 
         restore_result = runner.invoke(app, ["archive", "restore", str(archive_path), "--force"])
         assert restore_result.exit_code == 0

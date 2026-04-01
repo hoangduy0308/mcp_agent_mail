@@ -135,6 +135,19 @@ def desc(value: Any) -> Any:
     return _sa_desc(value)
 
 
+def _sql_expr(value: object) -> Any:
+    return cast(Any, value)
+
+
+def _active_window_identity_clause(now: datetime) -> Any:
+    expires_ts = _sql_expr(WindowIdentity.expires_ts)
+    return or_(expires_ts.is_(None), expires_ts > now)
+
+
+def _registered_agent_token_clause() -> Any:
+    return _sql_expr(Agent.registration_token).is_not(None)
+
+
 @contextlib.contextmanager
 def _git_repo(path: str | Path, search_parent_directories: bool = True) -> Any:
     """Context manager for GitPython Repo that ensures proper cleanup.
@@ -2859,7 +2872,7 @@ async def _get_window_identity(
             select(WindowIdentity).where(
                 cast(Any, WindowIdentity.project_id == project.id),
                 cast(Any, func.lower(WindowIdentity.window_uuid) == window_uuid.lower()),
-                or_(cast(Any, WindowIdentity.expires_ts).is_(None), cast(Any, WindowIdentity.expires_ts) > now),
+                _active_window_identity_clause(now),
             )
         )
         return result.scalars().first()
@@ -4406,6 +4419,17 @@ def build_mcp_server() -> FastMCP:
             embed_policy = sender.attachments_policy
 
         payload: dict[str, Any] | None = None
+        notification_message_meta: dict[str, Any] | None = None
+        notification_recipients: list[Agent] = []
+        sender_window_payload: dict[str, Any] = {}
+        _wi_uuid = getattr(settings, "window_identity_uuid", "") or ""
+        if _wi_uuid and _validate_window_uuid(_wi_uuid):
+            _wi = await _get_window_identity(project, _wi_uuid)
+            if _wi:
+                sender_window_payload = {
+                    "window_id": _wi.window_uuid,
+                    "window_display_name": _wi.display_name,
+                }
 
         async with _archive_write_lock(archive):
             # Server-side file_reservations enforcement: block if conflicting active exclusive file_reservation exists
@@ -4533,13 +4557,7 @@ def build_mcp_server() -> FastMCP:
                     "attachments": attachments_meta,
                 }
             )
-            # Enrich payload with sender's window identity if available
-            _wi_uuid = getattr(settings, "window_identity_uuid", "") or ""
-            if _wi_uuid and _validate_window_uuid(_wi_uuid):
-                _wi = await _get_window_identity(project, _wi_uuid)
-                if _wi:
-                    payload["window_id"] = _wi.window_uuid
-                    payload["window_display_name"] = _wi.display_name
+            payload.update(sender_window_payload)
             result_snapshot: dict[str, Any] = {
                 "deliveries": [
                     {
@@ -4568,24 +4586,23 @@ def build_mcp_server() -> FastMCP:
                 attachment_files,
                 commit_panel_text,
             )
+            notification_message_meta = {
+                "id": message.id,
+                "from": sender.name,
+                "subject": subject,
+                "importance": importance,
+            }
+            notification_recipients = list(to_agents + cc_agents)
 
-            # Emit notification signals for recipients (if enabled)
-            if settings.notifications.enabled:
-                message_meta = {
-                    "id": message.id,
-                    "from": sender.name,
-                    "subject": subject,
-                    "importance": importance,
-                }
-                # Signal to/cc recipients (not bcc - blind copies shouldn't trigger visible signals)
-                for agent in to_agents + cc_agents:
-                    with suppress(Exception):
-                        await emit_notification_signal(
-                            settings,
-                            project.slug,
-                            agent.name,
-                            message_meta,
-                        )
+        if settings.notifications.enabled and notification_message_meta:
+            for agent in notification_recipients:
+                with suppress(Exception):
+                    await emit_notification_signal(
+                        settings,
+                        project.slug,
+                        agent.name,
+                        notification_message_meta,
+                    )
 
         await ctx.info(
             f"Message {message.id} created by {sender.name} (to {', '.join(recipients_for_archive)})"
@@ -4634,13 +4651,25 @@ def build_mcp_server() -> FastMCP:
         - Call `health_check`.
         - If status != ok, sleep/retry with backoff and log `environment`/`http_host`/`http_port`.
         """
+        current_settings = get_settings()
+        database_url = current_settings.database.url
+        if database_url.startswith("sqlite"):
+            database_backend = "sqlite"
+        elif database_url.startswith("postgresql") or database_url.startswith("postgres"):
+            database_backend = "postgres"
+        else:
+            database_backend = "unknown"
         await ctx.info("Running health check.")
         return {
             "status": "ok",
-            "environment": settings.environment,
-            "http_host": settings.http.host,
-            "http_port": settings.http.port,
-            "database_url": settings.database.url,
+            "environment": current_settings.environment,
+            "cwd": str(Path.cwd()),
+            "storage_root": current_settings.storage.root,
+            "http_host": current_settings.http.host,
+            "http_port": current_settings.http.port,
+            "http_path": current_settings.http.path,
+            "database_backend": database_backend,
+            "database_url": database_url,
         }
 
     @mcp.tool(name="ensure_project")
@@ -4993,16 +5022,14 @@ def build_mcp_server() -> FastMCP:
         # Verify caller owns at least one agent in this project
         async with get_session() as session:
             agents_result = await session.execute(
-                select(Agent).where(Agent.project_id == project.id, cast(Any, Agent.registration_token).isnot(None))
+                select(Agent).where(Agent.project_id == project.id, _registered_agent_token_clause())
             )
             token_agents = agents_result.scalars().all()
-            if token_agents and (
-                not registration_token or not any(
-                    hmac.compare_digest(registration_token, a.registration_token)
-                    for a in token_agents
-                    if a.registration_token
-                )
-            ):
+            if token_agents and (not registration_token or not any(
+                hmac.compare_digest(registration_token, a.registration_token)
+                for a in token_agents
+                if a.registration_token
+            )):
                 raise ValueError("Invalid registration_token — must match a registered agent in the project")
 
         async with get_session() as session:
@@ -5037,16 +5064,14 @@ def build_mcp_server() -> FastMCP:
         # Verify caller owns at least one agent in this project
         async with get_session() as session:
             agents_result = await session.execute(
-                select(Agent).where(Agent.project_id == project.id, cast(Any, Agent.registration_token).isnot(None))
+                select(Agent).where(Agent.project_id == project.id, _registered_agent_token_clause())
             )
             token_agents = agents_result.scalars().all()
-            if token_agents and (
-                not registration_token or not any(
-                    hmac.compare_digest(registration_token, a.registration_token)
-                    for a in token_agents
-                    if a.registration_token
-                )
-            ):
+            if token_agents and (not registration_token or not any(
+                hmac.compare_digest(registration_token, a.registration_token)
+                for a in token_agents
+                if a.registration_token
+            )):
                 raise ValueError("Invalid registration_token — must match a registered agent in the project")
 
         async with get_session() as session:
@@ -5274,17 +5299,15 @@ def build_mcp_server() -> FastMCP:
             agents_result = await session.execute(
                 select(Agent).where(
                     cast(Any, Agent.project_id) == project_id,
-                    cast(Any, Agent.registration_token).isnot(None),
+                    _registered_agent_token_clause(),
                 )
             )
             token_agents = agents_result.scalars().all()
-            if token_agents and (
-                not registration_token or not any(
-                    hmac.compare_digest(registration_token, a.registration_token)
-                    for a in token_agents
-                    if a.registration_token
-                )
-            ):
+            if token_agents and (not registration_token or not any(
+                hmac.compare_digest(registration_token, a.registration_token)
+                for a in token_agents
+                if a.registration_token
+            )):
                 raise ValueError("Invalid registration_token — must match a registered agent in the project")
 
         deleted_counts: dict[str, int] = {}
@@ -5634,7 +5657,7 @@ def build_mcp_server() -> FastMCP:
             result = await session.execute(
                 select(WindowIdentity).where(
                     cast(Any, WindowIdentity.project_id == project.id),
-                    or_(cast(Any, WindowIdentity.expires_ts).is_(None), cast(Any, WindowIdentity.expires_ts) > now),
+                    _active_window_identity_clause(now),
                 )
             )
             identities = result.scalars().all()
@@ -5703,7 +5726,7 @@ def build_mcp_server() -> FastMCP:
                 select(WindowIdentity).where(
                     cast(Any, WindowIdentity.project_id == project.id),
                     cast(Any, func.lower(WindowIdentity.window_uuid) == window_uuid.lower()),
-                    or_(cast(Any, WindowIdentity.expires_ts).is_(None), cast(Any, WindowIdentity.expires_ts) > now),
+                    _active_window_identity_clause(now),
                 )
             )
             wi = result.scalars().first()
@@ -5770,7 +5793,7 @@ def build_mcp_server() -> FastMCP:
                 select(WindowIdentity).where(
                     cast(Any, WindowIdentity.project_id == project.id),
                     cast(Any, func.lower(WindowIdentity.window_uuid) == window_uuid.lower()),
-                    or_(cast(Any, WindowIdentity.expires_ts).is_(None), cast(Any, WindowIdentity.expires_ts) > now),
+                    _active_window_identity_clause(now),
                 )
             )
             wi = result.scalars().first()
@@ -8972,6 +8995,23 @@ def build_mcp_server() -> FastMCP:
         granted: list[dict[str, Any]] = []
         conflicts: list[dict[str, Any]] = []
         archive = await ensure_archive(settings, project.slug)
+        ctx_branch: Optional[str] = None
+        ctx_worktree: Optional[str] = None
+        try:
+            with _git_repo(project.human_key) as repo:
+                try:
+                    ctx_branch = repo.active_branch.name
+                except Exception:
+                    try:
+                        ctx_branch = repo.git.rev_parse("--abbrev-ref", "HEAD").strip()
+                    except Exception:
+                        ctx_branch = None
+                try:
+                    ctx_worktree = Path(repo.working_tree_dir or "").name or None
+                except Exception:
+                    ctx_worktree = None
+        except Exception:
+            pass
         async with _archive_write_lock(archive):
             async with get_session() as session:
                 existing_rows = await session.execute(
@@ -8985,23 +9025,6 @@ def build_mcp_server() -> FastMCP:
                 )
                 existing_reservations = [(row[0], row[1]) for row in existing_rows.all()]
             payloads: list[dict[str, Any]] = []
-            ctx_branch: Optional[str] = None
-            ctx_worktree: Optional[str] = None
-            try:
-                with _git_repo(project.human_key) as repo:
-                    try:
-                        ctx_branch = repo.active_branch.name
-                    except Exception:
-                        try:
-                            ctx_branch = repo.git.rev_parse("--abbrev-ref", "HEAD").strip()
-                        except Exception:
-                            ctx_branch = None
-                    try:
-                        ctx_worktree = Path(repo.working_tree_dir or "").name or None
-                    except Exception:
-                        ctx_worktree = None
-            except Exception:
-                pass
             # Build union PathSpec for fast conflict pre-filtering (O(n+m) instead of O(n*m))
             union_spec = _build_reservation_union_spec(existing_reservations, agent.id, exclusive)
 
@@ -11791,7 +11814,7 @@ def _apply_tool_filter(mcp: FastMCP, settings: Settings) -> None:
 
     # Identify tools to remove
     to_remove: list[str] = []
-    for tool_name in list(tools_registry.keys()):
+    for tool_name in list(tools_registry):
         cluster = TOOL_CLUSTER_MAP.get(tool_name, "unclassified")
         if not _should_expose_tool(tool_name, cluster, settings):
             to_remove.append(tool_name)

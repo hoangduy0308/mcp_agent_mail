@@ -9,6 +9,11 @@ from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.models import Agent, Message, MessageRecipient, Project
 
 
+def _require_id(value: int | None) -> int:
+    assert value is not None
+    return value
+
+
 def _seed_with_ack() -> None:
     async def _seed() -> None:
         await ensure_schema()
@@ -17,15 +22,15 @@ def _seed_with_ack() -> None:
             session.add(p)
             await session.commit()
             await session.refresh(p)
-            assert p.id is not None
-            a = Agent(project_id=p.id, name="Blue", program="x", model="y", task_description="")
+            project_id = _require_id(p.id)
+            a = Agent(project_id=project_id, name="Blue", program="x", model="y", task_description="")
             session.add(a)
             await session.commit()
             await session.refresh(a)
-            assert a.id is not None
+            agent_id = _require_id(a.id)
             m = Message(
-                project_id=p.id,
-                sender_id=a.id,
+                project_id=project_id,
+                sender_id=agent_id,
                 subject="NeedAck",
                 body_md="b",
                 ack_required=True,
@@ -36,7 +41,7 @@ def _seed_with_ack() -> None:
             await session.refresh(m)
             assert m.id is not None
             session.add(
-                MessageRecipient(message_id=m.id, agent_id=a.id, kind="to")
+                MessageRecipient(message_id=_require_id(m.id), agent_id=agent_id, kind="to")
             )
             await session.commit()
     asyncio.run(_seed())

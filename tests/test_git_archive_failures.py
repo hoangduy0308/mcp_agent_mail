@@ -13,6 +13,7 @@ Reference: mcp_agent_mail-c2x
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import time
 from pathlib import Path
@@ -23,8 +24,10 @@ from mcp_agent_mail.config import get_settings
 from mcp_agent_mail.storage import (
     AsyncFileLock,
     archive_write_lock,
+    collect_lock_status,
     ensure_archive,
     ensure_archive_root,
+    get_lock_telemetry,
     heal_archive_locks,
     write_agent_profile,
 )
@@ -368,6 +371,56 @@ class TestLockHealing:
         assert "locks_scanned" in result
         assert "locks_removed" in result
         assert "metadata_removed" in result
+        assert "locks_failed" in result
+
+    @pytest.mark.asyncio
+    async def test_heal_archive_locks_cleans_metadata_missing_orphan_lock(self, isolated_env):
+        """heal_archive_locks removes orphaned lock files even without metadata."""
+        settings = get_settings()
+        archive = await ensure_archive(settings, "metadata-missing-orphan")
+        stale_time = time.time() - 60
+        archive.lock_path.touch()
+        os.utime(archive.lock_path, (stale_time, stale_time))
+
+        result = await heal_archive_locks(settings)
+
+        assert str(archive.lock_path) in result["locks_removed"]
+        assert not archive.lock_path.exists()
+
+    def test_collect_lock_status_marks_metadata_missing_orphan_as_stale(self, isolated_env):
+        """Lock diagnostics should flag ownerless orphan lock files as stale."""
+        settings = get_settings()
+        archive_root = Path(settings.storage.root).expanduser().resolve()
+        archive_root.mkdir(parents=True, exist_ok=True)
+        lock_path = archive_root / ".archive.lock"
+        stale_time = time.time() - 60
+        lock_path.touch()
+        os.utime(lock_path, (stale_time, stale_time))
+
+        result = collect_lock_status(settings)
+
+        entry = next(item for item in result["locks"] if item["path"] == str(lock_path))
+        assert entry["stale_suspected"] is True
+        assert entry["stale_reason"] == "metadata_missing_orphan"
+
+    def test_collect_lock_status_does_not_register_probe_locks(self, isolated_env):
+        """Lock diagnostics should not mutate active lock telemetry."""
+        settings = get_settings()
+        archive_root = Path(settings.storage.root).expanduser().resolve()
+        archive_root.mkdir(parents=True, exist_ok=True)
+        lock_path = archive_root / ".archive.lock"
+        metadata_path = archive_root / ".archive.lock.owner.json"
+        lock_path.touch()
+        metadata_path.write_text(
+            '{"pid": 123, "created_ts": 1, "state": "held"}',
+            encoding="utf-8",
+        )
+
+        before = get_lock_telemetry()["active_locks"]
+        collect_lock_status(settings)
+        after = get_lock_telemetry()["active_locks"]
+
+        assert after == before
 
 
 # ============================================================================
@@ -399,6 +452,23 @@ class TestAsyncFileLock:
             assert metadata["pid"] == os.getpid()
 
     @pytest.mark.asyncio
+    async def test_file_lock_removes_artifacts_after_context_exit(self, isolated_env):
+        """AsyncFileLock should not leave a lingering lock file after release."""
+        settings = get_settings()
+        storage_root = Path(settings.storage.root).expanduser().resolve()
+        storage_root.mkdir(parents=True, exist_ok=True)
+
+        lock_path = storage_root / "round-trip.lock"
+        metadata_path = storage_root / "round-trip.lock.owner.json"
+
+        async with AsyncFileLock(lock_path):
+            assert lock_path.exists()
+            assert metadata_path.exists()
+
+        assert not lock_path.exists()
+        assert not metadata_path.exists()
+
+    @pytest.mark.asyncio
     async def test_file_lock_detects_stale_lock(self, isolated_env):
         """AsyncFileLock detects stale locks from dead processes."""
         settings = get_settings()
@@ -424,6 +494,100 @@ class TestAsyncFileLock:
             acquired = True
 
         assert acquired
+
+    @pytest.mark.asyncio
+    async def test_file_lock_preserves_metadata_when_cleanup_cannot_remove_lock(self, isolated_env, monkeypatch):
+        """Failed cleanup keeps metadata so the owner can still be diagnosed."""
+        settings = get_settings()
+        storage_root = Path(settings.storage.root).expanduser().resolve()
+        storage_root.mkdir(parents=True, exist_ok=True)
+
+        lock_path = storage_root / "cleanup-failure.lock"
+        metadata_path = storage_root / "cleanup-failure.lock.owner.json"
+        lock = AsyncFileLock(lock_path)
+        lock_path.touch()
+        metadata_path.write_text('{"pid": 123, "created_ts": 1}')
+
+        original_unlink = Path.unlink
+
+        def flaky_unlink(self: Path, *args, **kwargs):
+            if self == lock_path:
+                raise PermissionError("simulated sharing violation")
+            return original_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", flaky_unlink)
+        try:
+            removed = lock._remove_lock_artifacts(preserve_metadata_on_failure=True)
+        finally:
+            monkeypatch.setattr(Path, "unlink", original_unlink)
+
+        assert removed is False
+        assert metadata_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_file_lock_cleanup_closes_inactive_peer_fd_for_releasing_lock(self, isolated_env):
+        """Stale releasing locks can heal same-process leaked FDs on Windows."""
+        import json
+
+        settings = get_settings()
+        storage_root = Path(settings.storage.root).expanduser().resolve()
+        storage_root.mkdir(parents=True, exist_ok=True)
+
+        lock_path = storage_root / "peer-releasing.lock"
+        holder = AsyncFileLock(lock_path, timeout_seconds=0.5, stale_timeout_seconds=1.0)
+        await asyncio.to_thread(holder._lock.acquire, 0.1)
+        released_ts = time.time() - 10
+        holder._metadata_path.write_text(
+            json.dumps(
+                holder._metadata_payload(
+                    state="releasing",
+                    created_ts=released_ts - 5,
+                    released_ts=released_ts,
+                )
+            ),
+            encoding="utf-8",
+        )
+
+        lock = AsyncFileLock(lock_path, timeout_seconds=0.5, stale_timeout_seconds=1.0)
+        removed = await asyncio.to_thread(lock._cleanup_if_stale)
+
+        assert removed is True
+        assert not lock_path.exists()
+        assert not holder._metadata_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_file_lock_cleanup_closes_held_same_process_peer_for_releasing_lock(self, isolated_env):
+        """Same-process releasing locks should heal even if a peer still thinks it is held."""
+        import json
+
+        settings = get_settings()
+        storage_root = Path(settings.storage.root).expanduser().resolve()
+        storage_root.mkdir(parents=True, exist_ok=True)
+
+        lock_path = storage_root / "peer-releasing-held.lock"
+        holder = AsyncFileLock(lock_path, timeout_seconds=0.5, stale_timeout_seconds=1.0)
+        await holder.__aenter__()
+        released_ts = time.time()
+        holder._metadata_path.write_text(
+            json.dumps(
+                holder._metadata_payload(
+                    state="releasing",
+                    created_ts=released_ts - 5,
+                    released_ts=released_ts,
+                )
+            ),
+            encoding="utf-8",
+        )
+
+        healer = AsyncFileLock(lock_path, timeout_seconds=0.5, stale_timeout_seconds=1.0)
+        try:
+            removed = await asyncio.to_thread(healer._cleanup_if_stale)
+            assert removed is True
+            assert not lock_path.exists()
+            assert not holder._metadata_path.exists()
+        finally:
+            with contextlib.suppress(Exception):
+                await holder.__aexit__(None, None, None)
 
     @pytest.mark.asyncio
     async def test_file_lock_prevents_reentrant_acquisition(self, isolated_env):

@@ -8,7 +8,7 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from git import Repo
 from PIL import Image
-from rich.console import Console, Group
+from rich.console import Console, Group, RenderableType
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text
@@ -378,7 +378,7 @@ async def test_file_reservation_integration_logging(isolated_env, monkeypatch):
     console = Console(record=True, force_terminal=True)
 
     def _log(title: str, description: str, data: object | None = None) -> None:
-        renderables: list[Text | Syntax] = [Text(description)]
+        renderables: list[RenderableType] = [Text(description)]
         if data is not None:
             rendered = json.dumps(data, indent=2, default=str)
             renderables.append(Syntax(rendered, "json", theme="monokai", word_wrap=True))

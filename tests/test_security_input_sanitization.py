@@ -26,6 +26,11 @@ from mcp_agent_mail.http import build_http_app
 from mcp_agent_mail.models import Agent, Project
 
 
+def _require_id(value: int | None) -> int:
+    assert value is not None
+    return value
+
+
 def _rpc(method: str, params: dict[str, Any]) -> dict[str, Any]:
     """Create a JSON-RPC 2.0 request payload."""
     return {"jsonrpc": "2.0", "id": "1", "method": method, "params": params}
@@ -317,7 +322,7 @@ class TestPathTraversalPrevention:
             assert project.id is not None
 
             agent = Agent(
-                project_id=project.id,
+                project_id=_require_id(project.id),
                 name="TestAgent",
                 program="test",
                 model="test",
@@ -406,7 +411,7 @@ class TestLargeInputHandling:
             assert project.id is not None
 
             agent = Agent(
-                project_id=project.id,
+                project_id=_require_id(project.id),
                 name="MsgAgent",
                 program="test",
                 model="test",
@@ -466,7 +471,7 @@ class TestLargeInputHandling:
             assert project.id is not None
 
             agent = Agent(
-                project_id=project.id,
+                project_id=_require_id(project.id),
                 name="RecipAgent",
                 program="test",
                 model="test",
@@ -653,7 +658,7 @@ class TestSpecialCharactersInIdentifiers:
             assert project.id is not None
 
             agent = Agent(
-                project_id=project.id,
+                project_id=_require_id(project.id),
                 name="ThreadAgent",
                 program="test",
                 model="test",
@@ -732,7 +737,7 @@ class TestXSSPrevention:
             assert project.id is not None
 
             agent = Agent(
-                project_id=project.id,
+                project_id=_require_id(project.id),
                 name="XSSAgent",
                 program="test",
                 model="test",
@@ -784,6 +789,7 @@ class TestMalformedJSONHandling:
             for _ in range(100):
                 current["level"] = {"level": None}
                 current = current["level"]
+                assert isinstance(current, dict)
 
             response = await client.post(
                 settings.http.path,

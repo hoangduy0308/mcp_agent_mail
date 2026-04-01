@@ -6,9 +6,14 @@ from pathlib import Path
 import psutil
 import pytest
 
+from mcp_agent_mail import storage as storage_module
 from mcp_agent_mail.config import clear_settings_cache
 from mcp_agent_mail.db import reset_database_state
-from mcp_agent_mail.storage import clear_repo_cache
+from mcp_agent_mail.storage import (
+    cleanup_leaked_lockfile_fds,
+    clear_repo_cache,
+    stop_commit_queue,
+)
 
 # CPU overload threshold - skip benchmark tests if ALL cores are at this level
 CPU_OVERLOAD_THRESHOLD = 95.0
@@ -62,11 +67,13 @@ def event_loop():
     """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    loop.run_until_complete(stop_commit_queue())
 
     yield loop
 
     # Proper cleanup sequence
     try:
+        loop.run_until_complete(stop_commit_queue())
         # Cancel all pending tasks
         pending = asyncio.all_tasks(loop)
         for task in pending:
@@ -110,8 +117,15 @@ def isolated_env(tmp_path, monkeypatch):
     try:
         yield
     finally:
+        with contextlib.suppress(Exception):
+            queue = getattr(storage_module, "_COMMIT_QUEUE", None)
+            if queue is not None and not queue.loop.is_closed() and not queue.loop.is_running():
+                asyncio.set_event_loop(queue.loop)
+                queue.loop.run_until_complete(stop_commit_queue())
+
         # Close all cached Repo objects first (prevents file handle leaks)
         clear_repo_cache()
+        cleanup_leaked_lockfile_fds()
 
         # Suppress ResourceWarnings during cleanup since Python 3.14 warns about resources
         # being cleaned up by GC, which is exactly what we want
@@ -146,18 +160,32 @@ def isolated_env(tmp_path, monkeypatch):
         clear_settings_cache()
         reset_database_state()
 
-        if db_path.exists():
-            db_path.unlink()
+        with contextlib.suppress(PermissionError):
+            if db_path.exists():
+                db_path.unlink()
         storage_root = tmp_path / "storage"
         if storage_root.exists():
             for path in storage_root.rglob("*"):
                 if path.is_file():
-                    path.unlink()
+                    for attempt in range(10):
+                        try:
+                            path.unlink()
+                            break
+                        except PermissionError:
+                            cleanup_leaked_lockfile_fds()
+                            gc.collect()
+                            if attempt == 9:
+                                break
+                            import time
+
+                            time.sleep(0.05 * (attempt + 1))
             for path in sorted(storage_root.rglob("*"), reverse=True):
                 if path.is_dir():
-                    path.rmdir()
-            if storage_root.exists():
-                storage_root.rmdir()
+                    with contextlib.suppress(OSError):
+                        path.rmdir()
+            with contextlib.suppress(OSError):
+                if storage_root.exists():
+                    storage_root.rmdir()
 
 
 @pytest.fixture(autouse=True)

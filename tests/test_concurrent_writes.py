@@ -22,14 +22,21 @@ from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.storage import AsyncFileLock, _commit_lock_path
 
 
+def _abs_test_project_key(*parts: str) -> str:
+    return (Path.cwd().resolve() / "tmp-tests" / Path(*parts)).as_posix()
+
+
 async def _setup_project_and_agents(settings: _config.Settings) -> dict:
     """Create test project and agents using MCP tools."""
     await ensure_schema()
+    project_key = _abs_test_project_key("concurrent-test")
 
     server = build_mcp_server()
     async with Client(server) as client:
         # Create project via MCP tool
-        await client.call_tool("ensure_project", {"human_key": "/tmp/concurrent-test"})
+        project_result = await client.call_tool("ensure_project", {"human_key": project_key})
+        project_data = project_result.data if hasattr(project_result, "data") else {}
+        project_slug = project_data.get("slug") if isinstance(project_data, dict) else None
 
         # Create multiple agents with auto-generated adjective+noun names
         agents = []
@@ -37,7 +44,7 @@ async def _setup_project_and_agents(settings: _config.Settings) -> dict:
             result = await client.call_tool(
                 "register_agent",
                 {
-                    "project_key": "/tmp/concurrent-test",
+                    "project_key": project_key,
                     "program": "claude-code",
                     "model": "opus-4",
                     "task_description": f"Task {i}",
@@ -55,13 +62,14 @@ async def _setup_project_and_agents(settings: _config.Settings) -> dict:
     async with get_session() as session:
         row = await session.execute(
             text("SELECT id FROM projects WHERE human_key = :hk"),
-            {"hk": "/tmp/concurrent-test"},
+            {"hk": project_key},
         )
         project_id = row.scalar()
 
     return {
         "project_id": project_id,
-        "project_slug": "tmp-concurrent-test",
+        "project_key": project_key,
+        "project_slug": project_slug,
         "agents": agents,
     }
 
@@ -84,7 +92,7 @@ async def test_concurrent_message_sends(isolated_env):
         result = await client.call_tool(
             "send_message",
             {
-                "project_key": "/tmp/concurrent-test",
+                "project_key": data["project_key"],
                 "sender_name": sender,
                 "to": [recipient],
                 "subject": subject,
@@ -123,7 +131,7 @@ async def test_concurrent_messages_to_same_thread(isolated_env):
         result = await client.call_tool(
             "send_message",
             {
-                "project_key": "/tmp/concurrent-test",
+                "project_key": data["project_key"],
                 "sender_name": sender,
                 "to": [first_agent],
                 "subject": f"Thread Message {message_num}",
@@ -161,7 +169,7 @@ async def test_concurrent_file_reservation_different_paths(isolated_env):
         result = await client.call_tool(
             "file_reservation_paths",
             {
-                "project_key": "/tmp/concurrent-test",
+                "project_key": data["project_key"],
                 "agent_name": agent,
                 "paths": [path],
                 "ttl_seconds": 3600,
@@ -194,7 +202,7 @@ async def test_concurrent_file_reservation_same_path_conflict(isolated_env):
         result = await client.call_tool(
             "file_reservation_paths",
             {
-                "project_key": "/tmp/concurrent-test",
+                "project_key": data["project_key"],
                 "agent_name": agent,
                 "paths": ["shared/config.json"],
                 "ttl_seconds": 3600,
@@ -227,7 +235,7 @@ async def test_concurrent_file_reservation_overlapping_globs(isolated_env):
         result1 = await client.call_tool(
             "file_reservation_paths",
             {
-                "project_key": "/tmp/concurrent-test",
+                "project_key": data["project_key"],
                 "agent_name": data["agents"][0],
                 "paths": ["src/**/*.py"],
                 "ttl_seconds": 3600,
@@ -239,7 +247,7 @@ async def test_concurrent_file_reservation_overlapping_globs(isolated_env):
         result2 = await client.call_tool(
             "file_reservation_paths",
             {
-                "project_key": "/tmp/concurrent-test",
+                "project_key": data["project_key"],
                 "agent_name": data["agents"][1],
                 "paths": ["src/app.py"],
                 "ttl_seconds": 3600,
@@ -271,7 +279,7 @@ async def test_concurrent_inbox_fetches(isolated_env):
             await client.call_tool(
                 "send_message",
                 {
-                    "project_key": "/tmp/concurrent-test",
+                    "project_key": data["project_key"],
                     "sender_name": data["agents"][(i + 1) % 5],
                     "to": [data["agents"][0]],
                     "subject": f"Test Message {i}",
@@ -284,7 +292,7 @@ async def test_concurrent_inbox_fetches(isolated_env):
             result = await c.call_tool(
                 "fetch_inbox",
                 {
-                    "project_key": "/tmp/concurrent-test",
+                    "project_key": data["project_key"],
                     "agent_name": data["agents"][0],
                     "limit": 100,
                 },
@@ -314,7 +322,7 @@ async def test_concurrent_inbox_fetch_during_message_send(isolated_env):
         return await client.call_tool(
             "send_message",
             {
-                "project_key": "/tmp/concurrent-test",
+                "project_key": data["project_key"],
                 "sender_name": data["agents"][1],
                 "to": [data["agents"][0]],
                 "subject": f"Concurrent Send {i}",
@@ -328,7 +336,7 @@ async def test_concurrent_inbox_fetch_during_message_send(isolated_env):
         return await client.call_tool(
             "fetch_inbox",
             {
-                "project_key": "/tmp/concurrent-test",
+                "project_key": data["project_key"],
                 "agent_name": data["agents"][0],
                 "limit": 100,
             },
@@ -362,7 +370,7 @@ async def test_concurrent_project_ensure(isolated_env):
         """Ensure a project exists."""
         return await client.call_tool(
             "ensure_project",
-            {"human_key": f"/tmp/race-test-{suffix}"},
+            {"human_key": _abs_test_project_key(f"race-test-{suffix}")},
         )
 
     # Call ensure_project concurrently for same project
@@ -393,14 +401,15 @@ async def test_concurrent_agent_registration(isolated_env):
 
     async with Client(server) as client:
         # First ensure project
-        await client.call_tool("ensure_project", {"human_key": "/tmp/reg-test"})
+        project_key = _abs_test_project_key("reg-test")
+        await client.call_tool("ensure_project", {"human_key": project_key})
 
         async def register_agent(c: Client, i: int):
             """Register an agent."""
             return await c.call_tool(
                 "register_agent",
                 {
-                    "project_key": "/tmp/reg-test",
+                    "project_key": project_key,
                     "program": "claude-code",
                     "model": "opus-4",
                     "task_description": f"Task {i}",
@@ -439,7 +448,7 @@ async def test_concurrent_message_read_write(isolated_env):
     async with get_session() as session:
         await session.execute(
             text("INSERT INTO projects (slug, human_key, created_at) VALUES (:slug, :hk, datetime('now'))"),
-            {"slug": "db-concurrent", "hk": "/tmp/db-concurrent"},
+            {"slug": "db-concurrent", "hk": _abs_test_project_key("db-concurrent")},
         )
         await session.commit()
 

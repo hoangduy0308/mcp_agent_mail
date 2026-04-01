@@ -11,30 +11,38 @@ from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.models import Agent, AgentLink, Project
 
 
+def _require_id(value: int | None) -> int:
+    assert value is not None
+    return value
+
+
 @pytest.mark.asyncio
 async def test_contact_auto_allow_same_thread(isolated_env):
     server = build_mcp_server()
+    backend_path = Path(get_settings().storage.root).expanduser().resolve().parent / "backend"
+    backend_path.mkdir(parents=True, exist_ok=True)
     async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        project = await client.call_tool("ensure_project", {"human_key": str(backend_path)})
+        project_key = project.data["slug"]
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {"project_key": project_key, "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
         )
         await client.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+            {"project_key": project_key, "program": "codex", "model": "gpt-5", "name": "BlueLake"},
         )
         # Tighten policy to require contact; enforcement enabled by default
         await client.call_tool(
             "set_contact_policy",
-            {"project_key": "Backend", "agent_name": "BlueLake", "policy": "contacts_only"},
+            {"project_key": project_key, "agent_name": "BlueLake", "policy": "contacts_only"},
         )
 
         # Seed thread with ack-required message (bypasses enforcement)
         first = await client.call_tool(
             "send_message",
             {
-                "project_key": "Backend",
+                "project_key": project_key,
                 "sender_name": "GreenCastle",
                 "to": ["BlueLake"],
                 "subject": "ThreadSeed",
@@ -53,7 +61,7 @@ async def test_contact_auto_allow_same_thread(isolated_env):
         rep = await client.call_tool(
             "reply_message",
             {
-                "project_key": "Backend",
+                "project_key": project_key,
                 "message_id": seed_id,
                 "sender_name": "BlueLake",
                 "body_md": "ack",
@@ -65,7 +73,7 @@ async def test_contact_auto_allow_same_thread(isolated_env):
         third = await client.call_tool(
             "send_message",
             {
-                "project_key": "Backend",
+                "project_key": project_key,
                 "sender_name": "GreenCastle",
                 "to": ["BlueLake"],
                 "subject": "Followup",
@@ -89,10 +97,10 @@ async def test_external_cross_project_routing(isolated_env):
         await s.commit()
         await s.refresh(p1)
         await s.refresh(p2)
-        assert p1.id is not None
-        assert p2.id is not None
-        a_sender = Agent(project_id=p1.id, name="Alpha", program="codex", model="gpt-5", task_description="")
-        b_recv = Agent(project_id=p2.id, name="Receiver", program="codex", model="gpt-5", task_description="")
+        p1_id = _require_id(p1.id)
+        p2_id = _require_id(p2.id)
+        a_sender = Agent(project_id=p1_id, name="Alpha", program="codex", model="gpt-5", task_description="")
+        b_recv = Agent(project_id=p2_id, name="Receiver", program="codex", model="gpt-5", task_description="")
         s.add(a_sender)
         s.add(b_recv)
         await s.commit()
@@ -101,10 +109,10 @@ async def test_external_cross_project_routing(isolated_env):
         assert a_sender.id is not None
         assert b_recv.id is not None
         link = AgentLink(
-            a_project_id=p1.id,
-            a_agent_id=a_sender.id,
-            b_project_id=p2.id,
-            b_agent_id=b_recv.id,
+            a_project_id=p1_id,
+            a_agent_id=_require_id(a_sender.id),
+            b_project_id=p2_id,
+            b_agent_id=_require_id(b_recv.id),
             status="approved",
         )
         s.add(link)

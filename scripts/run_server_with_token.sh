@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-AM_RUST_BIN="/Users/jemanuel/.local/bin/am"
-AM_RUST_ENV_FILE_DEFAULT="/Users/jemanuel/.config/mcp-agent-mail/config.env"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "$REPO_ROOT"
+
+AM_RUST_BIN_DEFAULT="${HOME}/.local/bin/am"
+AM_RUST_BIN="${AM_RUST_BIN:-$AM_RUST_BIN_DEFAULT}"
+AM_RUST_ENV_FILE_DEFAULT="${REPO_ROOT}/.env"
 AM_RUST_ENV_FILE="${AM_RUST_ENV_FILE:-$AM_RUST_ENV_FILE_DEFAULT}"
 if [ ! -f "$AM_RUST_ENV_FILE" ] && [ -f "${HOME}/.config/mcp-agent-mail/config.env" ]; then
   AM_RUST_ENV_FILE="${HOME}/.config/mcp-agent-mail/config.env"
@@ -65,6 +70,11 @@ load_env_key() {
 for key in DATABASE_URL STORAGE_ROOT HTTP_HOST HTTP_PORT HTTP_PATH HTTP_BEARER_TOKEN TUI_ENABLED LLM_ENABLED LLM_DEFAULT_MODEL WORKTREES_ENABLED; do
   load_env_key "$key"
 done
+
+export DATABASE_URL="${DATABASE_URL:-sqlite+aiosqlite:///./storage.sqlite3}"
+export HTTP_HOST="${HTTP_HOST:-127.0.0.1}"
+export HTTP_PORT="${HTTP_PORT:-8765}"
+export HTTP_PATH="${HTTP_PATH:-/api/}"
 
 if [ ! -x "$AM_RUST_BIN" ]; then
   echo "mcp-agent-mail Rust CLI not found at $AM_RUST_BIN" >&2

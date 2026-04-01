@@ -10,6 +10,11 @@ from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.models import Agent, Message, MessageRecipient, Project
 
 
+def _require_id(value: int | None) -> int:
+    assert value is not None
+    return value
+
+
 def _seed_with_ack() -> dict[str, Any]:
     data: dict[str, Any] = {}
 
@@ -20,26 +25,25 @@ def _seed_with_ack() -> dict[str, Any]:
             session.add(p)
             await session.commit()
             await session.refresh(p)
-            assert p.id is not None
-            a = Agent(project_id=p.id, name="A", program="x", model="y")
-            b = Agent(project_id=p.id, name="B", program="x", model="y")
+            project_id = _require_id(p.id)
+            a = Agent(project_id=project_id, name="A", program="x", model="y")
+            b = Agent(project_id=project_id, name="B", program="x", model="y")
             session.add(a)
             session.add(b)
             await session.commit()
             await session.refresh(a)
             await session.refresh(b)
-            assert a.id is not None
-            assert b.id is not None
+            a_id = _require_id(a.id)
+            b_id = _require_id(b.id)
             # Ack-required message from A to B
             m = Message(
-                project_id=p.id, sender_id=a.id, subject="NeedsAck", body_md="body", ack_required=True
+                project_id=project_id, sender_id=a_id, subject="NeedsAck", body_md="body", ack_required=True
             )
             session.add(m)
             await session.flush()
-            assert m.id is not None
-            session.add(MessageRecipient(message_id=m.id, agent_id=b.id, kind="to"))
+            session.add(MessageRecipient(message_id=_require_id(m.id), agent_id=b_id, kind="to"))
             await session.commit()
-            data["project_id"] = p.id
+            data["project_id"] = project_id
             data["agent_b_name"] = b.name
             # No file reservations needed for this test; we only exercise CLI output
 

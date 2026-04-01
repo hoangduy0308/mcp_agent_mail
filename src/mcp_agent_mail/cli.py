@@ -2810,17 +2810,15 @@ def hard_delete_project(
             agents_result = await session.execute(
                 select(Agent).where(
                     cast(Any, Agent.project_id) == project_id,
-                    cast(Any, Agent.registration_token).isnot(None),
+                    cast(Any, Agent.registration_token).is_not(None),
                 )
             )
             token_agents = agents_result.scalars().all()
-            if token_agents and (
-                not registration_token or not any(
-                    _hmac.compare_digest(registration_token, a.registration_token)
-                    for a in token_agents
-                    if a.registration_token
-                )
-            ):
+            if token_agents and (not registration_token or not any(
+                _hmac.compare_digest(registration_token, a.registration_token)
+                for a in token_agents
+                if a.registration_token
+            )):
                 raise ValueError("Invalid registration_token — must match a registered agent in the project")
 
         deleted_counts: dict[str, int] = {}

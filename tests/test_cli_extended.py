@@ -10,6 +10,11 @@ from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.models import Agent, Project
 
 
+def _require_id(value: int | None) -> int:
+    assert value is not None
+    return value
+
+
 def _seed_backend() -> None:
     async def _seed() -> None:
         await ensure_schema()
@@ -18,8 +23,7 @@ def _seed_backend() -> None:
             session.add(p)
             await session.commit()
             await session.refresh(p)
-            assert p.id is not None
-            session.add(Agent(project_id=p.id, name="Blue", program="x", model="y", task_description=""))
+            session.add(Agent(project_id=_require_id(p.id), name="Blue", program="x", model="y", task_description=""))
             await session.commit()
     asyncio.run(_seed())
 

@@ -8,17 +8,26 @@ Tests cover:
 
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
 
+from mcp_agent_mail.config import get_settings
 from mcp_agent_mail.storage import (
     GitIndexLockError,
+    _CommitQueue,
+    _CommitRequest,
     _is_git_index_lock_error,
     _try_clean_stale_git_lock,
 )
+
+
+class _CommitCallRecord(dict[str, Any]):
+    pass
 
 # ============================================================================
 # _is_git_index_lock_error() Tests
@@ -203,6 +212,80 @@ class TestGitIndexLockError:
 class TestCommitRetryIntegration:
     """Integration tests for commit retry logic that don't require heavy mocking."""
 
+    def test_stop_commit_queue_stops_queue_on_owner_loop(self, monkeypatch):
+        """Stopping from another loop should still shut down the owner queue."""
+        import mcp_agent_mail.storage as storage_module
+
+        monkeypatch.setattr(storage_module, "_COMMIT_QUEUE", None)
+        monkeypatch.setattr(storage_module, "_COMMIT_QUEUE_LOCK", None)
+
+        owner_loop = asyncio.new_event_loop()
+        caller_loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(owner_loop)
+            queue = owner_loop.run_until_complete(storage_module._get_commit_queue())
+            assert queue._task is not None
+            owner_task = queue._task
+
+            asyncio.set_event_loop(caller_loop)
+            caller_loop.run_until_complete(storage_module.stop_commit_queue())
+
+            assert storage_module._COMMIT_QUEUE is None
+            assert owner_task.done()
+        finally:
+            asyncio.set_event_loop(None)
+            owner_loop.close()
+            caller_loop.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("batch_size", "max_batch_size"),
+        [
+            (1, 10),
+            (2, 10),
+            (11, 10),
+        ],
+    )
+    async def test_commit_queue_preserves_commit_file_lock(
+        self,
+        isolated_env,
+        monkeypatch,
+        batch_size: int,
+        max_batch_size: int,
+    ):
+        """Queued commits should still take the cross-process commit file lock."""
+        settings = get_settings()
+        repo_root = Path(settings.storage.root).expanduser().resolve()
+        queue = _CommitQueue(max_batch_size=max_batch_size)
+        calls: list[_CommitCallRecord] = []
+
+        async def fake_commit_direct(repo_root, settings, message, rel_paths, **kwargs):
+            calls.append(
+                _CommitCallRecord(
+                    repo_root=repo_root,
+                    message=message,
+                    rel_paths=list(rel_paths),
+                    kwargs=kwargs,
+                )
+            )
+
+        monkeypatch.setattr("mcp_agent_mail.storage._commit_direct", fake_commit_direct)
+
+        requests = [
+            _CommitRequest(
+                repo_root=repo_root,
+                settings=settings,
+                message=f"commit {idx}",
+                rel_paths=[f"path-{idx}.txt"],
+            )
+            for idx in range(batch_size)
+        ]
+
+        await queue._process_batch(requests)
+
+        assert calls
+        assert all(call["kwargs"].get("use_file_lock", True) is True for call in calls)
+
     @pytest.mark.asyncio
     async def test_commit_with_empty_paths_is_noop(self, isolated_env):
         """Committing empty path list returns immediately without errors."""
@@ -266,4 +349,7 @@ class TestCommitRetryIntegration:
 
         # Check the commit message
         latest_commit = next(iter(repo.iter_commits()))
-        assert "TestAgent" in str(latest_commit.message)
+        commit_message = latest_commit.message
+        if isinstance(commit_message, bytes):
+            commit_message = commit_message.decode("utf-8", "ignore")
+        assert "TestAgent" in str(commit_message)

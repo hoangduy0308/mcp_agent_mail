@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import json
@@ -121,5 +122,10 @@ async def test_async_file_lock_recovers_stale(tmp_path, monkeypatch):
         assert current.get("pid") == os.getpid()
 
     # Metadata should be cleaned up after release
+    for _ in range(20):
+        if not metadata_path.exists() and not lock_path.exists():
+            break
+        await asyncio.sleep(0.05)
+
     assert not metadata_path.exists()
     assert not lock_path.exists()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -72,10 +73,13 @@ async def test_tool_metrics_resource_populates_after_calls(isolated_env):
         # call a couple tools to increment metrics
         res = await client.call_tool("health_check", {})
         assert res.data["status"] == "ok"
-        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        assert res.data["database_backend"] == "sqlite"
+        assert res.data["http_path"] == "/mcp/"
+        assert res.data["cwd"]
+        await client.call_tool("ensure_project", {"human_key": Path.cwd().resolve().as_posix()})
 
         # tooling metrics resource
-        metrics_blocks = await client.read_resource("resource://tooling/metrics")
+        metrics_blocks = await client.read_resource("resource://tooling/metrics?format=json")
         assert metrics_blocks and metrics_blocks[0].text
         # the text is JSON; ensure tools list contains health_check
         assert "health_check" in metrics_blocks[0].text

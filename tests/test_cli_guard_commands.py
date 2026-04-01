@@ -34,6 +34,11 @@ if TYPE_CHECKING:
 runner = CliRunner()
 
 
+def _require_id(value: int | None) -> int:
+    assert value is not None
+    return value
+
+
 def _compute_slug_for_path(path: Path) -> str:
     """Compute the project slug the same way guard check does."""
     return slugify(str(path.resolve()))
@@ -100,7 +105,7 @@ async def _seed_project_with_agent(
         assert project.id is not None
 
         agent = Agent(
-            project_id=project.id,
+            project_id=_require_id(project.id),
             name=agent_name,
             program="test",
             model="test",

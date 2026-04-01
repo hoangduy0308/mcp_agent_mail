@@ -24,6 +24,7 @@ import logging
 import os
 import random
 import re
+import socket
 import sys
 import threading as _threading
 import time
@@ -32,7 +33,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, AsyncIterator, Iterable, Sequence, TypeVar, cast
+from typing import Any, AsyncIterator, Iterable, Protocol, Sequence, TypeVar, cast
 
 from filelock import SoftFileLock, Timeout
 from git import Actor, Repo
@@ -45,6 +46,19 @@ from .utils import validate_thread_id_format
 _logger = logging.getLogger(__name__)
 _IMAGE_PATTERN = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<path>[^)]+)\)")
 _SUBJECT_SLUG_RE = re.compile(r"[^a-zA-Z0-9._-]+")
+_ORPHAN_LOCK_TIMEOUT_SECONDS = 5.0
+_LOCK_CLEANUP_RETRIES = 8
+_LOCK_CLEANUP_BASE_DELAY_SECONDS = 0.05
+
+
+class _ResourceModule(Protocol):
+    RLIMIT_NOFILE: int
+
+    def getrlimit(self, resource: int) -> tuple[int, int]: ...
+
+
+def _git_tree_getitem(tree: Any, part: str) -> Any:
+    return tree / part
 
 
 # =============================================================================
@@ -89,6 +103,7 @@ class _CommitQueue:
         max_wait_ms: float = 50.0,
         max_queue_size: int = 100,
     ) -> None:
+        self._loop = asyncio.get_running_loop()
         self._queue: asyncio.Queue[_CommitRequest] = asyncio.Queue(maxsize=max_queue_size)
         self._max_batch_size = max_batch_size
         self._max_wait_ms = max_wait_ms
@@ -114,6 +129,11 @@ class _CommitQueue:
             "queue_size": self._queue.qsize(),
             "running": self._task is not None and not self._task.done(),
         }
+
+    @property
+    def loop(self) -> asyncio.AbstractEventLoop:
+        """Return the event loop that owns this queue instance."""
+        return self._loop
 
     async def start(self) -> None:
         """Start the background queue processor."""
@@ -249,7 +269,12 @@ class _CommitQueue:
                 # Single request - just commit it directly
                 req = requests[0]
                 try:
-                    await _commit_direct(req.repo_root, req.settings, req.message, req.rel_paths)
+                    await _commit_direct(
+                        req.repo_root,
+                        req.settings,
+                        req.message,
+                        req.rel_paths,
+                    )
                     req.future.set_result(None)
                     self._commits += 1
                 except Exception as e:
@@ -265,7 +290,7 @@ class _CommitQueue:
                         break
                     all_paths.update(path_set)
 
-                if can_batch and len(requests) <= 5:  # Only batch small groups
+                if can_batch and len(requests) <= self._max_batch_size:
                     # Merge into single commit
                     merged_paths: list[str] = []
                     merged_messages: list[str] = []
@@ -298,7 +323,12 @@ class _CommitQueue:
                     # Process sequentially (conflicts or large batch)
                     for req in requests:
                         try:
-                            await _commit_direct(req.repo_root, req.settings, req.message, req.rel_paths)
+                            await _commit_direct(
+                                req.repo_root,
+                                req.settings,
+                                req.message,
+                                req.rel_paths,
+                            )
                             req.future.set_result(None)
                             self._commits += 1
                         except Exception as e:
@@ -321,13 +351,58 @@ def _get_commit_queue_lock() -> asyncio.Lock:
 async def _get_commit_queue() -> _CommitQueue:
     """Get or create the global commit queue."""
     global _COMMIT_QUEUE
+    running_loop = asyncio.get_running_loop()
     if _COMMIT_QUEUE is not None:
-        return _COMMIT_QUEUE
+        task = _COMMIT_QUEUE._task
+        if _COMMIT_QUEUE.loop is running_loop and task is not None and not task.done():
+            return _COMMIT_QUEUE
     async with _get_commit_queue_lock():
         if _COMMIT_QUEUE is None:
             _COMMIT_QUEUE = _CommitQueue()
             await _COMMIT_QUEUE.start()
+            return _COMMIT_QUEUE
+        task = _COMMIT_QUEUE._task
+        if _COMMIT_QUEUE.loop is running_loop and task is not None and not task.done():
+            return _COMMIT_QUEUE
+        _COMMIT_QUEUE = _CommitQueue()
+        await _COMMIT_QUEUE.start()
         return _COMMIT_QUEUE
+
+
+async def stop_commit_queue(timeout_seconds: float = 5.0) -> None:
+    """Stop and reset the global commit queue for the current process."""
+    global _COMMIT_QUEUE
+    queue = _COMMIT_QUEUE
+    if queue is None:
+        return
+    current_loop = asyncio.get_running_loop()
+    if queue.loop is current_loop:
+        _COMMIT_QUEUE = None
+        await queue.stop(timeout_seconds=timeout_seconds)
+        return
+    if queue.loop.is_closed():
+        _COMMIT_QUEUE = None
+        return
+    if queue.loop.is_running():
+        import concurrent.futures
+
+        future = asyncio.run_coroutine_threadsafe(
+            queue.stop(timeout_seconds=timeout_seconds),
+            queue.loop,
+        )
+        try:
+            future.result(timeout=timeout_seconds + 1.0)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise TimeoutError("Timed out stopping commit queue on owner loop") from None
+        _COMMIT_QUEUE = None
+        return
+
+    await asyncio.to_thread(
+        queue.loop.run_until_complete,
+        queue.stop(timeout_seconds=timeout_seconds),
+    )
+    _COMMIT_QUEUE = None
 
 
 def get_commit_queue_stats() -> dict[str, Any]:
@@ -610,8 +685,8 @@ def get_fd_usage() -> tuple[int, int]:
     On platforms where this isn't available, returns (-1, -1).
     """
     try:
-        import resource
-        soft_limit, _hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        resource_module = cast(_ResourceModule, __import__("resource"))
+        soft_limit, _hard_limit = resource_module.getrlimit(resource_module.RLIMIT_NOFILE)
         # Count open file descriptors by checking /proc/self/fd (Linux) or /dev/fd (macOS)
         fd_dir = Path("/dev/fd") if sys.platform == "darwin" else Path("/proc/self/fd")
         if fd_dir.exists():
@@ -712,7 +787,11 @@ class AsyncFileLock:
         max_retries: int = 5,
     ) -> None:
         self._path = Path(path)
-        self._lock = SoftFileLock(str(self._path))
+        # AsyncFileLock acquires/releases through asyncio.to_thread(), which may hop
+        # across different worker threads. filelock defaults to thread-local state,
+        # so keeping that default would strand the real lock FD in the acquire thread
+        # and make release() in another worker think nothing is held.
+        self._lock = SoftFileLock(str(self._path), thread_local=False)
         self._timeout = float(timeout_seconds)
         self._stale_timeout = float(max(stale_timeout_seconds, 0.0))
         self._max_retries = max_retries
@@ -725,13 +804,23 @@ class AsyncFileLock:
         self._loop_key: tuple[int, str] | None = None
         self._process_lock: asyncio.Lock | None = None
         self._process_lock_held = False
-        # Register for telemetry
+        self._register_instance()
+
+    def _register_instance(self) -> None:
         with _LOCK_INSTANCES_GUARD:
             _ACTIVE_LOCK_INSTANCES[id(self)] = self
 
-    def __del__(self) -> None:
+    def _unregister_instance(self) -> None:
         with _LOCK_INSTANCES_GUARD:
             _ACTIVE_LOCK_INSTANCES.pop(id(self), None)
+
+    def __del__(self) -> None:
+        guard = globals().get("_LOCK_INSTANCES_GUARD")
+        active_instances = globals().get("_ACTIVE_LOCK_INSTANCES")
+        if guard is None or active_instances is None:
+            return
+        with guard:
+            active_instances.pop(id(self), None)
 
     def _force_close_fd(self) -> bool:
         """Force-close the underlying SoftFileLock file descriptor if still open.
@@ -775,6 +864,7 @@ class AsyncFileLock:
         """
         try:
             self._lock.release()
+            self._force_close_fd()
             return True
         except Exception as exc:
             _logger.error(
@@ -784,6 +874,216 @@ class AsyncFileLock:
             # Fallback: force-close the FD to prevent leak
             self._force_close_fd()
             return False
+
+    def _read_metadata(self) -> dict[str, Any]:
+        if not self._metadata_path.exists():
+            return {}
+        try:
+            raw = json.loads(self._metadata_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    def _pid_start_ts(self) -> float | None:
+        try:
+            import psutil
+
+            created = psutil.Process(self._pid).create_time()
+        except Exception:
+            return None
+        return float(created)
+
+    def _metadata_payload(
+        self,
+        *,
+        state: str,
+        created_ts: float | None = None,
+        released_ts: float | None = None,
+        release_error: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "pid": self._pid,
+            "hostname": socket.gethostname(),
+            "cwd": str(Path.cwd()),
+            "argv": list(sys.argv),
+            "python_executable": sys.executable,
+            "platform": sys.platform,
+            "lock_path": str(self._path),
+            "metadata_path": str(self._metadata_path),
+            "state": state,
+            "created_ts": time.time() if created_ts is None else float(created_ts),
+            "updated_ts": time.time(),
+        }
+        pid_start_ts = self._pid_start_ts()
+        if pid_start_ts is not None:
+            payload["pid_start_ts"] = pid_start_ts
+        if released_ts is not None:
+            payload["released_ts"] = float(released_ts)
+        if release_error:
+            payload["release_error"] = release_error
+        return payload
+
+    def _lock_age_seconds(self, metadata: dict[str, Any], now: float) -> float | None:
+        created_ts = metadata.get("created_ts")
+        if isinstance(created_ts, (int, float)):
+            return max(0.0, now - float(created_ts))
+        with contextlib.suppress(Exception):
+            return max(0.0, now - self._path.stat().st_mtime)
+        return None
+
+    def _released_age_seconds(self, metadata: dict[str, Any], now: float) -> float | None:
+        released_ts = metadata.get("released_ts")
+        if isinstance(released_ts, (int, float)):
+            return max(0.0, now - float(released_ts))
+        return None
+
+    @classmethod
+    def classify_lock_state(
+        cls,
+        path: Path,
+        metadata: dict[str, Any] | None = None,
+        *,
+        now: float | None = None,
+        stale_timeout_seconds: float = 180.0,
+        current_pid: int | None = None,
+    ) -> dict[str, Any]:
+        current_time = time.time() if now is None else now
+        current_metadata = metadata if metadata is not None else {}
+        owner_pid_raw = current_metadata.get("pid") if isinstance(current_metadata, dict) else None
+        owner_pid: int | None = None
+        if owner_pid_raw is not None:
+            with contextlib.suppress(Exception):
+                owner_pid = int(owner_pid_raw)
+        owner_alive = cls._pid_alive(owner_pid) if owner_pid else False
+        created_ts = current_metadata.get("created_ts") if isinstance(current_metadata, dict) else None
+        if isinstance(created_ts, (int, float)):
+            age_seconds: float | None = max(0.0, current_time - float(created_ts))
+        else:
+            age_seconds = None
+            with contextlib.suppress(Exception):
+                age_seconds = max(0.0, current_time - path.stat().st_mtime)
+        released_ts = current_metadata.get("released_ts") if isinstance(current_metadata, dict) else None
+        released_age_seconds = (
+            max(0.0, current_time - float(released_ts))
+            if isinstance(released_ts, (int, float))
+            else None
+        )
+        metadata_state = (
+            str(current_metadata.get("state") or "held").strip().lower()
+            if current_metadata
+            else "missing_metadata"
+        )
+        stale_reason: str | None = None
+
+        if current_metadata:
+            if metadata_state in {"releasing", "released", "release_failed"}:
+                if current_pid is not None and owner_pid == current_pid:
+                    stale_reason = f"{metadata_state}_same_process"
+                elif (
+                    isinstance(released_age_seconds, (int, float))
+                    and released_age_seconds >= _ORPHAN_LOCK_TIMEOUT_SECONDS
+                ):
+                    stale_reason = f"{metadata_state}_timeout"
+            elif owner_pid is not None and not owner_alive:
+                stale_reason = "owner_dead"
+            elif (
+                owner_pid is None
+                and isinstance(age_seconds, (int, float))
+                and age_seconds >= _ORPHAN_LOCK_TIMEOUT_SECONDS
+            ):
+                stale_reason = "metadata_missing_pid"
+            elif (
+                stale_timeout_seconds > 0
+                and isinstance(age_seconds, (int, float))
+                and age_seconds >= stale_timeout_seconds
+            ):
+                stale_reason = "age_exceeded"
+        elif isinstance(age_seconds, (int, float)) and age_seconds >= _ORPHAN_LOCK_TIMEOUT_SECONDS:
+            stale_reason = "metadata_missing_orphan"
+
+        return {
+            "owner_pid": owner_pid,
+            "owner_alive": owner_alive,
+            "age_seconds": age_seconds,
+            "released_age_seconds": released_age_seconds,
+            "metadata_state": metadata_state,
+            "stale_reason": stale_reason,
+            "stale_suspected": stale_reason is not None,
+        }
+
+    def _classify_lock_state(
+        self,
+        metadata: dict[str, Any] | None = None,
+        *,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        current_metadata = self._read_metadata() if metadata is None else metadata
+        return self.classify_lock_state(
+            self._path,
+            current_metadata,
+            now=now,
+            stale_timeout_seconds=self._stale_timeout,
+            current_pid=self._pid,
+        )
+
+    def _write_metadata(self) -> None:
+        payload = self._metadata_payload(state="held")
+        self._metadata_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def _mark_releasing_metadata(self, *, release_ok: bool, release_error: str | None = None) -> None:
+        created_ts: float | None = None
+        current = self._read_metadata()
+        if isinstance(current.get("created_ts"), (int, float)):
+            created_ts = float(current["created_ts"])
+        payload = self._metadata_payload(
+            state="releasing" if release_ok else "release_failed",
+            created_ts=created_ts,
+            released_ts=time.time(),
+            release_error=release_error,
+        )
+        self._metadata_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def _force_close_peer_lock_fds(self, *, include_held: bool = False) -> int:
+        """Force-close leaked FDs from peer lock instances for the same path."""
+        with _LOCK_INSTANCES_GUARD:
+            peers = [
+                lock
+                for lock in _ACTIVE_LOCK_INSTANCES.values()
+                if lock._lock_key == self._lock_key and (lock is self or include_held or not lock._held)
+            ]
+        closed = 0
+        for peer in peers:
+            if peer._force_close_fd():
+                closed += 1
+        return closed
+
+    def _remove_lock_artifacts(self, *, preserve_metadata_on_failure: bool) -> bool:
+        for attempt in range(_LOCK_CLEANUP_RETRIES):
+            with contextlib.suppress(FileNotFoundError, PermissionError):
+                self._path.unlink(missing_ok=True)
+            if not self._path.exists():
+                if self._metadata_path.exists():
+                    with contextlib.suppress(FileNotFoundError, PermissionError):
+                        self._metadata_path.unlink(missing_ok=True)
+                return True
+            time.sleep(_LOCK_CLEANUP_BASE_DELAY_SECONDS * (attempt + 1))
+
+        self._force_close_peer_lock_fds()
+        self._force_close_fd()
+        for attempt in range(_LOCK_CLEANUP_RETRIES):
+            with contextlib.suppress(FileNotFoundError, PermissionError):
+                self._path.unlink(missing_ok=True)
+            if not self._path.exists():
+                if self._metadata_path.exists():
+                    with contextlib.suppress(FileNotFoundError, PermissionError):
+                        self._metadata_path.unlink(missing_ok=True)
+                return True
+            time.sleep(_LOCK_CLEANUP_BASE_DELAY_SECONDS * (attempt + 1))
+
+        if not preserve_metadata_on_failure and self._metadata_path.exists():
+            with contextlib.suppress(FileNotFoundError, PermissionError):
+                self._metadata_path.unlink(missing_ok=True)
+        return not self._path.exists()
 
     async def __aenter__(self) -> None:
         """Acquire the file lock with adaptive retry and stale lock detection.
@@ -817,7 +1117,10 @@ class AsyncFileLock:
         await self._process_lock.acquire()
         self._process_lock_held = True
         _PROCESS_LOCK_OWNERS[self._loop_key] = current_task_id
+        self._register_instance()
         try:
+            if self._path.exists():
+                await _to_thread(self._cleanup_if_stale)
             total_timeout = self._timeout if self._timeout > 0 else 60.0
             remaining = total_timeout
 
@@ -913,20 +1216,24 @@ class AsyncFileLock:
                     # again as a safety net (idempotent)
                     await _to_thread(self._force_close_fd)
                 self._held = False
-                # Only unlink files if we confirmed the FD is closed (release
-                # succeeded or was force-closed).  This prevents unlinking a
-                # lock path while another process may have legitimately
-                # acquired it in between.
-                for cleanup_coro in (
-                    _to_thread(self._metadata_path.unlink, missing_ok=True),
-                    _to_thread(self._path.unlink, missing_ok=True),
-                ):
-                    task = asyncio.create_task(cleanup_coro)
-                    try:
-                        await asyncio.shield(task)
-                    except BaseException:
-                        with contextlib.suppress(Exception):
-                            await task
+                release_error = None if release_ok else "release_strict_failed"
+                with contextlib.suppress(Exception):
+                    await _to_thread(
+                        self._mark_releasing_metadata,
+                        release_ok=release_ok,
+                        release_error=release_error,
+                    )
+                cleanup_task = asyncio.create_task(
+                    _to_thread(
+                        self._remove_lock_artifacts,
+                        preserve_metadata_on_failure=True,
+                    )
+                )
+                try:
+                    await asyncio.shield(cleanup_task)
+                except BaseException:
+                    with contextlib.suppress(Exception):
+                        await cleanup_task
 
             if self._loop_key is not None:
                 _PROCESS_LOCK_OWNERS.pop(self._loop_key, None)
@@ -940,6 +1247,7 @@ class AsyncFileLock:
             ):
                 _PROCESS_LOCKS.pop(self._loop_key, None)
             self._process_lock = None
+            self._unregister_instance()
             raise
 
     def _cleanup_if_stale(self) -> bool:
@@ -953,55 +1261,26 @@ class AsyncFileLock:
         """
         if not self._path.exists():
             return False
-        now = time.time()
-        metadata: dict[str, Any] = {}
-        if self._metadata_path.exists():
-            try:
-                metadata = json.loads(self._metadata_path.read_text(encoding="utf-8"))
-            except Exception:
-                metadata = {}
-        pid_val = metadata.get("pid")
-        pid_int: int | None = None
-        if pid_val is not None:
-            with contextlib.suppress(Exception):
-                pid_int = int(pid_val)
-        owner_alive = self._pid_alive(pid_int) if pid_int else False
-        created_ts = metadata.get("created_ts")
-        age = None
-        if isinstance(created_ts, (int, float)):
-            age = now - float(created_ts)
-        else:
-            with contextlib.suppress(Exception):
-                age = now - self._path.stat().st_mtime
-
-        # Lock is stale if EITHER the owner is dead OR the age exceeds timeout
-        # Special case: if stale_timeout is 0, only check owner liveness (ignore age)
-        is_stale = False
-        if not owner_alive:
-            # Owner process is dead - lock is stale regardless of age
-            is_stale = True
-        elif self._stale_timeout > 0 and isinstance(age, (int, float)) and age >= self._stale_timeout:
-            # Lock is too old - stale regardless of owner status
-            # (only if stale_timeout > 0, otherwise age check is disabled)
-            is_stale = True
-
-        if not is_stale:
+        metadata = self._read_metadata()
+        lock_state = self._classify_lock_state(metadata)
+        if not lock_state["stale_suspected"]:
             return False
-
-        # Clean up stale lock
-        with contextlib.suppress(Exception):
-            self._path.unlink(missing_ok=True)
-        with contextlib.suppress(Exception):
-            self._metadata_path.unlink(missing_ok=True)
-        return True
-
-    def _write_metadata(self) -> None:
-        payload = {
-            "pid": self._pid,
-            "created_ts": time.time(),
-        }
-        self._metadata_path.write_text(json.dumps(payload), encoding="utf-8")
-        return None
+        peer_fds_closed = 0
+        include_held_peers = str(lock_state.get("stale_reason") or "").endswith("_same_process")
+        if lock_state["metadata_state"] in {"releasing", "released", "release_failed", "missing_metadata"}:
+            peer_fds_closed = self._force_close_peer_lock_fds(include_held=include_held_peers)
+        removed = self._remove_lock_artifacts(preserve_metadata_on_failure=True)
+        if removed:
+            _logger.warning(
+                "file_lock.stale_removed",
+                extra={
+                    "path": str(self._path),
+                    "stale_reason": lock_state["stale_reason"],
+                    "metadata_state": lock_state["metadata_state"],
+                    "peer_fds_closed": peer_fds_closed,
+                },
+            )
+        return removed
 
     async def __aexit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object) -> None:
         if self._held:
@@ -1018,24 +1297,26 @@ class AsyncFileLock:
             if not release_ok:
                 # Last resort: ensure FD is closed even if everything above failed
                 await _to_thread(self._force_close_fd)
-
-            # Step 2: Windows needs a short delay after close before unlink
-            if sys.platform == "win32":
-                await asyncio.sleep(0.01)
-
-            # Step 3: Clean up metadata file.  The lock file itself is already
-            # unlinked by SoftFileLock._release(); we only need to remove the
-            # metadata sidecar.  Redundant unlink of self._path is safe (missing_ok).
-            for cleanup_path in (self._metadata_path, self._path):
-                task = asyncio.create_task(
-                    _to_thread(cleanup_path.unlink, missing_ok=True)
-                )
-                try:
-                    await asyncio.shield(task)
-                except BaseException:
-                    with contextlib.suppress(Exception):
-                        await task
             self._held = False
+
+            release_error = None if release_ok else "release_strict_failed"
+            with contextlib.suppress(Exception):
+                await _to_thread(
+                    self._mark_releasing_metadata,
+                    release_ok=release_ok,
+                    release_error=release_error,
+                )
+            cleanup_task = asyncio.create_task(
+                _to_thread(
+                    self._remove_lock_artifacts,
+                    preserve_metadata_on_failure=True,
+                )
+            )
+            try:
+                await asyncio.shield(cleanup_task)
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    await cleanup_task
 
         # Clean up process-level locks
         if self._loop_key is not None:
@@ -1051,6 +1332,7 @@ class AsyncFileLock:
             _PROCESS_LOCKS.pop(self._loop_key, None)
         self._process_lock = None
         self._loop_key = None
+        self._unregister_instance()
         return None
 
     @staticmethod
@@ -1172,42 +1454,44 @@ def collect_lock_status(settings: Settings) -> dict[str, Any]:
                 except Exception:
                     metadata = {}
             info["metadata"] = metadata
-
-            pid_val = metadata.get("pid")
-            pid_int: int | None = None
-            if pid_val is not None:
-                with contextlib.suppress(Exception):
-                    pid_int = int(pid_val)
-            info["owner_pid"] = pid_int
-            info["owner_alive"] = AsyncFileLock._pid_alive(pid_int) if pid_int else False
+            lock_state = AsyncFileLock.classify_lock_state(
+                lock_path,
+                metadata if isinstance(metadata, dict) else {},
+                now=now,
+                stale_timeout_seconds=180.0,
+            )
+            info["owner_pid"] = lock_state["owner_pid"]
+            info["owner_alive"] = lock_state["owner_alive"]
+            info["age_seconds"] = lock_state["age_seconds"]
+            info["released_age_seconds"] = lock_state["released_age_seconds"]
+            info["lock_state"] = lock_state["metadata_state"]
+            info["stale_suspected"] = lock_state["stale_suspected"]
+            info["stale_reason"] = lock_state["stale_reason"]
+            info["stale_timeout_seconds"] = 180.0
 
             created_ts = metadata.get("created_ts") if isinstance(metadata, dict) else None
-            if isinstance(created_ts, (int, float)):
-                info["created_ts"] = datetime.fromtimestamp(created_ts, tz=timezone.utc).isoformat()
-                info["age_seconds"] = max(0.0, now - float(created_ts))
-            else:
-                info["created_ts"] = None
-                info["age_seconds"] = None
-
-            stale_threshold = AsyncFileLock(lock_path)._stale_timeout
-            info["stale_timeout_seconds"] = stale_threshold
-            age_val = info.get("age_seconds")
-            # Lock is stale if EITHER the owner is dead OR the age exceeds timeout
-            # Special case: if stale_timeout is 0, only check owner liveness (ignore age)
-            is_stale = False
-            if bool(metadata):
-                if not info["owner_alive"]:
-                    # Owner process is dead - lock is stale
-                    is_stale = True
-                elif stale_threshold > 0 and isinstance(age_val, (int, float)) and age_val >= stale_threshold:
-                    # Lock is too old - stale
-                    # (only if stale_timeout > 0, otherwise age check is disabled)
-                    is_stale = True
-            info["stale_suspected"] = is_stale
+            info["created_ts"] = (
+                datetime.fromtimestamp(created_ts, tz=timezone.utc).isoformat()
+                if isinstance(created_ts, (int, float))
+                else None
+            )
+            released_ts = metadata.get("released_ts") if isinstance(metadata, dict) else None
+            info["released_ts"] = (
+                datetime.fromtimestamp(released_ts, tz=timezone.utc).isoformat()
+                if isinstance(released_ts, (int, float))
+                else None
+            )
+            info["owner_hostname"] = metadata.get("hostname") if isinstance(metadata, dict) else None
+            info["owner_cwd"] = metadata.get("cwd") if isinstance(metadata, dict) else None
+            info["owner_argv"] = metadata.get("argv") if isinstance(metadata, dict) else None
+            info["owner_python_executable"] = (
+                metadata.get("python_executable") if isinstance(metadata, dict) else None
+            )
+            info["owner_pid_start_ts"] = metadata.get("pid_start_ts") if isinstance(metadata, dict) else None
 
             summary["total"] += 1
 
-            if is_stale:
+            if lock_state["stale_suspected"]:
                 summary["stale"] += 1
             elif info["owner_alive"]:
                 summary["active"] += 1
@@ -1885,6 +2169,8 @@ async def _commit_direct(
     settings: Settings,
     message: str,
     rel_paths: Sequence[str],
+    *,
+    use_file_lock: bool = True,
 ) -> None:
     """Perform a git commit directly without queue batching.
 
@@ -1941,10 +2227,18 @@ async def _commit_direct(
             target_repo.index.commit(final_message, author=actor, committer=actor)
 
     commit_lock_path = _commit_lock_path(repo_root, rel_paths)
-    await _to_thread(commit_lock_path.parent.mkdir, parents=True, exist_ok=True)
+
+    @asynccontextmanager
+    async def _optional_commit_lock() -> AsyncIterator[None]:
+        if not use_file_lock:
+            yield
+            return
+        await _to_thread(commit_lock_path.parent.mkdir, parents=True, exist_ok=True)
+        async with AsyncFileLock(commit_lock_path):
+            yield
 
     try:
-        async with AsyncFileLock(commit_lock_path):
+        async with _optional_commit_lock():
             attempt_repo = repo
             # Maximum retries for git index.lock contention (happens with concurrent agents)
             max_index_lock_retries = 5
@@ -2086,6 +2380,7 @@ async def heal_archive_locks(settings: Settings) -> dict[str, Any]:
         "locks_scanned": 0,
         "locks_removed": [],
         "metadata_removed": [],
+        "locks_failed": [],
     }
     if not root.exists():
         return summary
@@ -2099,6 +2394,16 @@ async def heal_archive_locks(settings: Settings) -> dict[str, Any]:
             removed = await _to_thread(lock._cleanup_if_stale)
             if removed:
                 summary["locks_removed"].append(str(lock_path))
+            elif lock_path.exists():
+                state = lock._classify_lock_state(now=time.time())
+                if state["stale_suspected"]:
+                    summary["locks_failed"].append(
+                        {
+                            "path": str(lock_path),
+                            "stale_reason": state["stale_reason"],
+                            "lock_state": state["metadata_state"],
+                        }
+                    )
         except FileNotFoundError:
             continue
 
@@ -2813,9 +3118,10 @@ async def get_historical_inbox_snapshot(
         messages = []
         try:
             # Navigate to the inbox folder in the commit tree
-            tree = cast(Any, closest_commit.tree)
+            tree_obj: Any = closest_commit.tree
             for part in inbox_path.split("/"):
-                tree = tree / part
+                tree_obj = _git_tree_getitem(tree_obj, part)
+            tree = cast(Tree, tree_obj)
 
             # Recursively traverse inbox subdirectories (YYYY/MM/) to find message files
             def traverse_tree(subtree: Any, depth: int = 0) -> None:
